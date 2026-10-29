@@ -1,0 +1,6 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "exsmiley" },
+  "description": "Mods for Claude Code",
+  "plugins": [{ "name": "agent-stats", "source": "./agent-stats" }]
+}

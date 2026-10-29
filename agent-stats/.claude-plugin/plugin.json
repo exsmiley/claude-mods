@@ -1,0 +1,6 @@
+{
+  "name": "agent-stats",
+  "version": "0.1.0",
+  "description": "Charts how many Claude Code sessions and subagents you start each day",
+  "types": "./types/index.d.ts"
+}
