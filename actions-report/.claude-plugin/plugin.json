@@ -1,0 +1,6 @@
+{
+  "name": "actions-report",
+  "version": "0.1.0",
+  "description": "A fun monthly report of a repo's GitHub Actions minutes per person, with workflow stats and awards",
+  "types": "./types/index.d.ts"
+}

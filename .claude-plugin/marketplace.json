@@ -1,6 +1,17 @@
 {
   "name": "claude-mods",
-  "owner": { "name": "exsmiley" },
+  "owner": {
+    "name": "exsmiley"
+  },
   "description": "Mods for Claude Code",
-  "plugins": [{ "name": "agent-stats", "source": "./agent-stats" }]
+  "plugins": [
+    {
+      "name": "agent-stats",
+      "source": "./agent-stats"
+    },
+    {
+      "name": "actions-report",
+      "source": "./actions-report"
+    }
+  ]
 }
