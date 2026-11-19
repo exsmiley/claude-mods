@@ -73,8 +73,32 @@ function createStatus(opts = {}) {
   // own: { docker: ['supabase_*'], pids: [1234], names: ['postgres'] }.
   if (opts.watch) s.watch = mergeWatch({}, opts.watch)
   let ended = false
+  let yielded = false
+
+  // Another live process writing the same id for a newer run owns the file:
+  // stop writing rather than flip the pane between two runs.
+  function newerOwner() {
+    try {
+      const other = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const pid = Number(other.pid)
+      if (!pid || pid === process.pid) return undefined
+      if (!(Date.parse(other.startedAt) > Date.parse(s.startedAt))) return undefined
+      process.kill(pid, 0) // throws when that process is gone
+      return pid
+    } catch {
+      return undefined
+    }
+  }
 
   function write() {
+    if (yielded) return
+    const owner = newerOwner()
+    if (owner) {
+      yielded = true
+      clearInterval(beat)
+      console.error(`[job-status] ${file} now belongs to a newer run (pid ${owner}); this process stops writing it`)
+      return
+    }
     s.updatedAt = now()
     try {
       fs.writeFileSync(tmp, JSON.stringify(s, null, 1))
@@ -85,7 +109,7 @@ function createStatus(opts = {}) {
     }
   }
 
-  const beat = setInterval(() => { if (!ended) write() }, HEARTBEAT_MS)
+  var beat = setInterval(() => { if (!ended) write() }, HEARTBEAT_MS)
   if (beat.unref) beat.unref()
   process.on('exit', () => { if (!ended) { ended = true; s.state = 'stopped'; s.running = []; write() } })
 

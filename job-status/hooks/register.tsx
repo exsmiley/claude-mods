@@ -146,6 +146,20 @@ function parseRun(name: string, text: string, mtimeMs: number): RunView {
 // Peak memory per run, for this session (module memory: a reload resets it).
 const peaks = new Map<string, number>()
 
+// Which pids have written each run id lately. Two live writers on one id
+// (an old run's process still alive beside a restarted one) make the pane
+// flip between them every poll, so it says so.
+const WRITER_WINDOW_MS = 120_000
+const writers = new Map<string, Map<number, { at: number; startedAtMs: number }>>()
+
+function noteWriter(r: RunView, now: number) {
+  if (r.pid === undefined) return
+  const seen = writers.get(r.id) ?? new Map<number, { at: number; startedAtMs: number }>()
+  seen.set(r.pid, { at: now, startedAtMs: r.startedAtMs })
+  for (const [pid, w] of seen) if (now - w.at > WRITER_WINDOW_MS) seen.delete(pid)
+  writers.set(r.id, seen)
+}
+
 function poll($: EngineInterface): Promise<void> {
   inFlight ??= pollOnce($).finally(() => {
     inFlight = undefined
@@ -189,6 +203,15 @@ async function pollOnce($: EngineInterface) {
       } else if (now - r.updatedAtMs > STALE_MS) {
         r.isStale = true
         r.staleReason = `no update for ${fmtDur(now - r.updatedAtMs)}`
+      }
+      noteWriter(r, now)
+      const others = [...(writers.get(r.id) ?? new Map<number, { at: number; startedAtMs: number }>())]
+        .filter(([pid]) => pid !== r.pid && table?.procs.has(pid))
+      if (others.length) {
+        // Name the older one: that's the process to stop.
+        const all = [[r.pid, r.startedAtMs] as const, ...others.map(([pid, w]) => [pid, w.startedAtMs] as const)]
+        const oldest = [...all].sort((a, b) => a[1] - b[1])[0]
+        r.writerConflict = `${all.length} live processes write this file (pids ${all.map(a => a[0]).join(', ')}); its numbers flip between them. Stop the older one (pid ${oldest?.[0]}).`
       }
       if (!table || r.isStale) continue
       const found = await attribute($, table, r, home, now, vm)
@@ -359,6 +382,7 @@ export const register: Register = on => {
             <Text color={stateColor} bold>{stateText}</Text>
           </Box>
           {r.isStale && r.staleReason && <Text color="error" size="footnote">{r.staleReason}</Text>}
+          {r.writerConflict && <Text color="warning" size="footnote">{`⚠ ${r.writerConflict}`}</Text>}
           {r.error && <Text color="error">{r.error}</Text>}
           {r.total && !Progress ? (
             <Text>

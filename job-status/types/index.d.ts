@@ -59,6 +59,8 @@ export type RunView = {
   /** pid gone or updatedAt too old while the file still says running */
   isStale: boolean
   staleReason?: string
+  /** set when more than one live process has written this id lately */
+  writerConflict?: string
   error?: string
   /** the run's processes: tree, group, folders, and what they connect to */
   usage?: Usage

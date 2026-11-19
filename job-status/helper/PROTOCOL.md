@@ -91,3 +91,11 @@ The helper writes atomically, heartbeats every 15 s (unref'd timer), never
 throws on write errors, and on process `exit` without `end()` marks the run
 `stopped`. `JOB_STATUS_DIR` overrides the folder. Other languages: just write
 the JSON above with temp-file + rename.
+
+**One writer per id.** If a run is restarted under the same id while the old
+process is still alive, both would rewrite the file and the pane would flip
+between them (counts, total and ETA jumping every few seconds). The helper
+checks before each write: when another live process owns the file for a newer
+run, it stops writing. The pane also warns when it sees two live pids write one
+id, naming the older one to stop. A writer not using the helper should give
+each run its own id, or stop the old writer first.

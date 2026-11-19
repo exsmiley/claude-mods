@@ -176,3 +176,20 @@ test('a file status.cjs wrote renders live', async ($, on) => {
   expect(texts.some(t => /^CPU 13%  ·  RAM 50 MB  ·  1 proc$/.test(t))).toBe(true)
   await ui.unmount()
 })
+
+test('two live processes writing one id are called out', async ($, on) => {
+  // The file flips between an old run (4242) and a restarted one (6000).
+  const older = { ...live, id: 'flip', pid: 4242, startedAt: iso(3_600_000), total: 644 }
+  const newer = { ...live, id: 'flip', pid: 6000, startedAt: iso(600_000), total: 249 }
+  let reads = 0
+  const files = {} as Record<string, unknown>
+  Object.defineProperty(files, 'flip.json', { enumerable: true, get: () => (reads++ % 2 ? older : newer) })
+  world(on as never, files, PROCS)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'job-status', args: '' })
+  await $.command.run({ command: 'job-status', args: '' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts.some(t => /^⚠ 2 live processes write this file \(pids \d+, \d+\); .* Stop the older one \(pid 4242\)\.$/.test(t))).toBe(true)
+  await ui.unmount()
+})
