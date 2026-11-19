@@ -12,6 +12,10 @@
     {
       "name": "actions-report",
       "source": "./actions-report"
+    },
+    {
+      "name": "job-status",
+      "source": "./job-status"
     }
   ]
 }
