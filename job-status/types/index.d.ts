@@ -38,6 +38,8 @@ export type RunningRow = { label: string; startedAt: string; pid?: number; usage
 /** One run as the pane draws it: the file's fields plus what the poll found. */
 export type RunView = {
   id: string
+  /** the run's file in ~/.claude/job-status, set by the poll */
+  fileName?: string
   title: string
   state: string
   startedAtMs: number

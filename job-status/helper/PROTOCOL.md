@@ -51,7 +51,15 @@ environment that Claude Code gives every command it runs.
 
 The pane marks a `running` run **stale** when its `pid` no longer exists or
 `updatedAt` is more than 90 s old. Finished runs older than a day collapse into
-one line. Delete a run's file to remove it from the pane.
+one line.
+
+**Clearing.** A finished or stale run has a **✕ clear** button. When there are
+several, **✕ clear N finished runs** clears them all, and so does
+`/job-status clear`. Finished runs are also cleared on their own once they are
+a week old. Clearing moves the file into `.cleared/` in this folder, which the
+pane skips. Nothing is deleted: move a file back to bring its run back, and
+empty `.cleared/` yourself when you like. A live run can't be cleared, since its
+writer would just write it again.
 
 ### CPU and memory
 

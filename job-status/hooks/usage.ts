@@ -222,10 +222,11 @@ export function refreshDocker($: EngineInterface, now: number): void {
       rows = undefined
       isDown = true
     } finally {
-      rowsAt = await $.clock.now()
+      // the clock can be gone by now (the mod reloaded mid-sample)
+      rowsAt = await $.clock.now().catch(() => Date.now())
       dockerInFlight = undefined
     }
-  })()
+  })().catch(() => {})
 }
 
 /** Containers' usage at host cost: their share of the Docker VM, when it is seen. */

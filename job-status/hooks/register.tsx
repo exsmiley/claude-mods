@@ -25,6 +25,7 @@ const PANE = 'job-status'
 const POLL_MS = 2500
 const STALE_MS = 90_000 // no write for this long while "running" → stale
 const OLD_MS = 24 * 3600_000 // finished runs older than this are collapsed
+const AUTO_CLEAR_MS = 7 * 24 * 3600_000 // ...and cleared away after this
 const MAX_RUNS = 30
 
 const runs = atom({ plugin: 'job-status', key: 'runs' } as const, [] as RunView[], {
@@ -51,6 +52,44 @@ const toMs = (v: unknown): number | undefined => {
 const num = (v: unknown): number | undefined =>
   typeof v === 'number' && Number.isFinite(v) ? v : undefined
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : v == null ? d : String(v))
+
+/** Finished, or marked running by a process that is gone or silent. */
+function isClearable(r: RunView): boolean {
+  return r.state !== 'running' || r.isStale
+}
+
+/**
+ * Move run files into ~/.claude/job-status/.cleared/, which the pane skips.
+ * Not a delete: move a file back to bring its run back.
+ */
+async function moveToCleared($: EngineInterface, fileNames: string[]): Promise<string[]> {
+  const home = await $.env.get('HOME')
+  const names = fileNames.filter(n => /^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/.test(n))
+  if (!home || !names.length) return []
+  const dir = `${home}/.claude/job-status`
+  try {
+    await $.process.run(['mkdir', '-p', `${dir}/.cleared`], { timeoutMs: 5000 })
+    const r = await $.process.run(['mv', '-f', ...names.map(n => `${dir}/${n}`), `${dir}/.cleared/`], { timeoutMs: 5000 })
+    if (r.exitCode !== 0) {
+      $.ui.toast(`Couldn't clear: ${(r.stderr || `mv exited ${r.exitCode}`).trim().slice(0, 200)}`)
+      return []
+    }
+    return names
+  } catch (err) {
+    $.ui.toast(`Couldn't clear: ${err instanceof Error ? err.message : String(err)}`)
+    return []
+  }
+}
+
+/** Clear runs now: move their files, drop them from the pane, then re-read. */
+async function clearRuns($: EngineInterface, list: RunView[]): Promise<number> {
+  const moved = await moveToCleared($, list.flatMap(r => (r.fileName ? [r.fileName] : [])))
+  if (moved.length) {
+    await update($, runs, l => l.filter(r => !r.fileName || !moved.includes(r.fileName)))
+    void poll($)
+  }
+  return moved.length
+}
 
 /** Switch the desktop app to the session that started a run. */
 async function openSession($: EngineInterface, hostId: string) {
@@ -204,7 +243,9 @@ async function pollOnce($: EngineInterface) {
     const list: RunView[] = []
     for (const f of files) {
       try {
-        list.push(parseRun(f.name, await $.fs.read(`${dir}/${f.name}`), f.mtimeMs))
+        const view = parseRun(f.name, await $.fs.read(`${dir}/${f.name}`), f.mtimeMs)
+        view.fileName = f.name
+        list.push(view)
       } catch {
         // vanished between list and read
       }
@@ -260,8 +301,12 @@ async function pollOnce($: EngineInterface) {
       if (vm) machine.dockerVm = vm
       if (docker.isDown()) machine.isDockerUnavailable = true
     }
-    list.sort((a, b) => b.startedAtMs - a.startedAtMs)
-    await update($, runs, () => list)
+    // Finished runs a week old leave the pane on their own.
+    const expired = list.filter(r => isClearable(r) && now - (r.endedAtMs ?? r.updatedAtMs) > AUTO_CLEAR_MS)
+    const cleared = expired.length ? await moveToCleared($, expired.flatMap(r => (r.fileName ? [r.fileName] : []))) : []
+    const shown = list.filter(r => !r.fileName || !cleared.includes(r.fileName))
+    shown.sort((a, b) => b.startedAtMs - a.startedAtMs)
+    await update($, runs, () => shown)
     await update($, nowAtom, () => now)
     await update($, machineAtom, () => machine)
 
@@ -332,15 +377,19 @@ export const register: Register = on => {
     const started = await next(e)
     await $.command.register({
       name: 'job-status',
-      description: 'Show the live job-status pane (runs in ~/.claude/job-status)',
+      description: 'Show the live job-status pane (runs in ~/.claude/job-status); "clear" clears finished runs',
     })
     void poll($)
     $.clock.every(POLL_MS, () => poll($))
     return started
   })
 
-  on('command.run', { command: 'job-status' }, async $ => {
+  on('command.run', { command: 'job-status' }, async ($, e) => {
     await poll($)
+    if (e.args.trim() === 'clear') {
+      const n = await clearRuns($, (await read($, runs)).filter(isClearable))
+      return { text: n ? `Cleared ${n} finished run(s) into ~/.claude/job-status/.cleared.` : 'No finished runs to clear.' }
+    }
     await $.ui.open({ id: PANE, title: 'Job status' })
     const list = await read($, runs)
     const live = list.filter(r => r.state === 'running' && !r.isStale).length
@@ -399,15 +448,24 @@ export const register: Register = on => {
             <Text bold wrap="truncate-end">{r.title}</Text>
             <Text color={stateColor} bold>{stateText}</Text>
           </Box>
-          {r.session?.hostId ? (
-            // The desktop pane only follows https links, so ask macOS to open
-            // the app's own deep link, which switches to that session.
-            <Button key={`open-${r.id}`} plain onPress={() => openSession($, r.session!.hostId!)}>
-              open session ↗
-            </Button>
-          ) : r.session?.id ? (
-            <Text dimColor size="footnote">{`claude --resume ${r.session.id}`}</Text>
-          ) : null}
+          {(r.session || isClearable(r)) && (
+            <Box flexDirection="row" gap={2}>
+              {r.session?.hostId ? (
+                // The desktop pane only follows https links, so ask macOS to open
+                // the app's own deep link, which switches to that session.
+                <Button key={`open-${r.id}`} plain onPress={() => openSession($, r.session!.hostId!)}>
+                  open session ↗
+                </Button>
+              ) : r.session?.id ? (
+                <Text dimColor size="footnote">{`claude --resume ${r.session.id}`}</Text>
+              ) : null}
+              {isClearable(r) && (
+                <Button key={`clear-${r.id}`} plain onPress={() => clearRuns($, [r])}>
+                  ✕ clear
+                </Button>
+              )}
+            </Box>
+          )}
           {r.isStale && r.staleReason && <Text color="error" size="footnote">{r.staleReason}</Text>}
           {r.writerConflict && <Text color="warning" size="footnote">{`⚠ ${r.writerConflict}`}</Text>}
           {r.error && <Text color="error">{r.error}</Text>}
@@ -546,6 +604,11 @@ export const register: Register = on => {
               </Box>
             ))}
           </Box>
+        )}
+        {list.filter(isClearable).length > 1 && (
+          <Button key="clear-finished" plain onPress={() => clearRuns($, list.filter(isClearable))}>
+            {`✕ clear ${list.filter(isClearable).length} finished runs`}
+          </Button>
         )}
         {fresh.map(r => drawRun(r, r.state !== 'running'))}
         {fresh.length === 0 && <Text dimColor>No live or recent runs.</Text>}

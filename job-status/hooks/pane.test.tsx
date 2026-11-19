@@ -60,6 +60,9 @@ const CONNECTS: Record<number, string> = {
 
 /** deep links the pane asked macOS to open */
 const OPENED: string[] = []
+/** the run files the world holds; `mv` takes them out */
+let FILES: Record<string, unknown> = {}
+const MOVED: string[][] = []
 
 const host = (procs: P[]) => (_: unknown, e: unknown) => {
   const argv = (e as { argv: string[] }).argv
@@ -71,6 +74,11 @@ const host = (procs: P[]) => (_: unknown, e: unknown) => {
         : out(procs.map(p => ` ${p.pid} ${p.cmd ?? p.comm}`).join('\n'))
     case 'sysctl':
       return out(argv[2] === 'hw.ncpu' ? '8\n' : '17179869184\n')
+    case 'mv': {
+      MOVED.push(argv.slice(2))
+      for (const src of argv.slice(2, -1)) delete FILES[src.split('/').pop() ?? '']
+      return out('')
+    }
     case 'open':
       OPENED.push(argv[1] ?? '')
       return out('')
@@ -114,6 +122,8 @@ const old = {
 }
 
 function world(on: (event: string, hook: (...a: never[]) => unknown) => unknown, files: Record<string, unknown>, procs: P[], now = NOW) {
+  FILES = files
+  MOVED.length = 0
   on('command.register', () => ({ value: { command: 'job-status' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
@@ -207,5 +217,31 @@ test('two live processes writing one id are called out', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts.some(t => /^⚠ 2 live processes write this file \(pids \d+, \d+\); .* Stop the older one \(pid 4242\)\.$/.test(t))).toBe(true)
+  await ui.unmount()
+})
+
+test('finished runs clear from the pane, by hand or after a week', async ($, on) => {
+  const ancient = { ...old, id: 'ancient', title: 'Ancient run', startedAt: iso(9 * 86_400_000), updatedAt: iso(8 * 86_400_000), endedAt: iso(8 * 86_400_000) }
+  world(on as never, { 'live.json': live, 'dead.json': dead, 'old.json': old, 'ancient.json': ancient }, PROCS)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run(RUN)
+
+  // a week-old finished run is moved out on its own, not deleted
+  expect(MOVED).toEqual([['/home/u/.claude/job-status/ancient.json', '/home/u/.claude/job-status/.cleared/']])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const buttons = async () => (await ui.findAll({ type: 'Button' })).map(b => b.text ?? '')
+  // the live run has no clear button; the stale and the old one do, and both together
+  expect((await buttons()).filter(t => /✕ clear$/.test(t))).toHaveLength(1) // old run is folded away
+  expect(await buttons()).toContain('✕ clear 2 finished runs')
+
+  await ui.press({ key: 'clear-dead' })
+  expect(MOVED.at(-1)).toEqual(['/home/u/.claude/job-status/dead.json', '/home/u/.claude/job-status/.cleared/'])
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts.some(t => /^Dead run$/.test(t))).toBe(false)
+  expect(texts.some(t => /^Screenshot compare$/.test(t))).toBe(true)
+
+  const r = await $.command.run({ ...RUN, args: 'clear' })
+  expect(r).toMatchObject({ text: 'Cleared 1 finished run(s) into ~/.claude/job-status/.cleared.' })
+  expect(Object.keys(FILES)).toEqual(['live.json'])
   await ui.unmount()
 })
