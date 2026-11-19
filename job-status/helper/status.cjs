@@ -22,6 +22,17 @@ function safeId(id) {
   return String(id).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120) || 'run'
 }
 
+function mergeWatch(a, b) {
+  const out = {}
+  for (const k of ['docker', 'pids', 'names']) {
+    const vals = [...(a[k] || []), ...([].concat(b[k] || []))]
+      .map(v => (k === 'pids' ? Number(v) : String(v)))
+      .filter(v => (k === 'pids' ? v > 0 : v))
+    if (vals.length) out[k] = [...new Set(vals)]
+  }
+  return out
+}
+
 function createStatus(opts = {}) {
   const id = safeId(opts.id || `run-${Date.now()}`)
   const dir = opts.dir || DIR
@@ -50,6 +61,9 @@ function createStatus(opts = {}) {
     totalJobMs: 0,
   }
   if (opts.counts) Object.assign(s.counts, opts.counts)
+  // What else the run's CPU / RAM should include: { docker: ['supabase_*'],
+  // pids: [1234], names: ['postgres'] }. See README.md.
+  if (opts.watch) s.watch = mergeWatch({}, opts.watch)
   let ended = false
 
   function write() {
@@ -83,6 +97,11 @@ function createStatus(opts = {}) {
         if (pid > 0) next.pid = pid
         s.running.push(next)
       }
+      write()
+    },
+    // Add to what the run's usage counts (merges, de-duplicated).
+    watch(more) {
+      s.watch = mergeWatch(s.watch || {}, more || {})
       write()
     },
     // Set or change a running job's pid after start (spawn often comes later).

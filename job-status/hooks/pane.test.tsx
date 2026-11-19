@@ -32,6 +32,7 @@ const live = {
     { label: 'grp/c@site', status: 'fail', detail: 'Timeout', at: iso(30_000) },
   ],
   notes: ['11:59:00 lane 2 restarted'],
+  watch: { docker: ['supabase_*'] },
 }
 const dead = { ...live, id: 'dead', title: 'Dead run', pid: 999, startedAt: iso(900_000) }
 const old = {
@@ -39,6 +40,25 @@ const old = {
   startedAt: iso(3 * 86_400_000), updatedAt: iso(2 * 86_400_000), endedAt: iso(2 * 86_400_000),
   running: [],
 }
+const PS = [
+  '    1     0   0.0   1000 /sbin/launchd',
+  ' 4242     1 250.0 2097152 /usr/local/bin/node',
+  ' 4300  4242  50.0 1048576 /Applications/Chrome.app/Contents/MacOS/Chrome',
+].join('\n')
+const DOCKER = [
+  JSON.stringify({ Name: 'supabase_db_x', CPUPerc: '100.00%', MemUsage: '1GiB / 23.44GiB' }),
+  JSON.stringify({ Name: 'other_y', CPUPerc: '10.00%', MemUsage: '512MiB / 23.44GiB' }),
+].join('\n')
+const VM = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages active:   262144.\nPages wired down:   131072.\nPages occupied by compressor:   131072.\n'
+const host = (extraPs = '') => (_: unknown, e: unknown) => {
+  const argv = (e as { argv: string[] }).argv
+  const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '' } })
+  if (argv[0] === 'sysctl') return out(argv[2] === 'hw.ncpu' ? '8\n' : '17179869184\n')
+  if (argv[0] === 'docker') return out(DOCKER)
+  if (argv[0] === 'vm_stat') return out(VM)
+  return out(PS + extraPs + '\n')
+}
+
 const FILES: Record<string, unknown> = { 'live.json': live, 'dead.json': dead, 'old.json': old }
 
 test('the pane draws live, stale and collapsed runs', async ($, on) => {
@@ -54,15 +74,11 @@ test('the pane draws live, stale and collapsed runs', async ($, on) => {
     const name = String((e as { path: string }).path).split('/').pop() ?? ''
     return { value: JSON.stringify(FILES[name]) }
   })
-  // ps -A: the run (4242) with one child job process (4300); 999 is not there.
-  on('process.run', (_, e) => {
-    const argv = (e as { argv: string[] }).argv
-    if (argv[0] === 'sysctl') return { value: { exitCode: 0, stdout: '17179869184\n', stderr: '' } }
-    return { value: { exitCode: 0, stdout: '    1     0   0.0   1000\n 4242     1 250.0 2097152\n 4300  4242  50.0 1048576\n', stderr: '' } }
-  })
+  on('process.run', host())
   on('clock.every', () => ({ value: {} }))
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'job-status', args: '' })
   await $.command.run({ command: 'job-status', args: '' })
 
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -72,9 +88,14 @@ test('the pane draws live, stale and collapsed runs', async ($, on) => {
     expect((await ui.find({ type: 'Text', text: /In flight \(2\)/ }))?.text).toBeTruthy()
     expect((await ui.find({ type: 'Text', text: /⚠ grp\/slow@site/ }))?.text).toBeTruthy()
     expect((await ui.find({ type: 'Text', text: /412 px differ/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /^CPU 300%$/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /RAM 3\.0 GB of 16\.0 GB/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /2 procs/ }))?.text).toBeTruthy()
+    const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+    expect(texts).toContain('Run CPU 300%  ·  RAM 3.0 GB  ·  2 procs')
+    expect(texts).toContain('Docker CPU 100%  ·  RAM 1.0 GB  ·  1 container')
+    expect(texts).toContain('Total CPU 400%  ·  ')
+    expect(texts).toContain('RAM 4.0 GB of 16.0 GB')
+    expect(texts.some(t => /^Machine  CPU 38% of 8 cores  ·  RAM 8\.0 GB of 16\.0 GB used$/.test(t))).toBe(true)
+    expect(texts.some(t => /^Docker   2 containers  ·  CPU 110%  ·  RAM 1\.5 GB$/.test(t))).toBe(true)
+    expect(texts.some(t => /not counted/.test(t))).toBe(false)
     expect((await ui.find({ type: 'Text', text: /^50% 1\.0 GB$/ }))?.text).toBeTruthy()
     expect((await ui.find({ type: 'Text', text: /ETA/ }))?.text).toMatch(/elapsed 10m00s/)
     expect(await ui.find({ type: 'Text', text: /^Old run$/ })).toBeFalsy()
@@ -94,13 +115,15 @@ test('a file status.cjs wrote renders live', async ($, on) => {
   on('clock.now', () => ({ value: Date.parse(REAL.updatedAt) + 1000 }))
   on('fs.list', () => ({ value: [{ name: 'demo-run.json', kind: 'file', size: 1, mtimeMs: Date.parse(REAL.updatedAt), isLink: false }] }))
   on('fs.read', () => ({ value: JSON.stringify(REAL) }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: `${REAL.pid} 1 12.5 51200\n`, stderr: '' } }))
+  on('process.run', host(`\n ${REAL.pid} 1 12.5 51200 node`))
   on('clock.every', () => ({ value: {} }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'job-status', args: '' })
   await $.command.run({ command: 'job-status', args: '' })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts).toContain('running')
+  expect(texts.some(t => /^2 Docker containers running \(CPU 110%, RAM 1\.5 GB\) not counted: add watch\.docker$/.test(t))).toBe(true)
   expect(texts.some(t => /In flight \(4\)/.test(t))).toBe(true)
   await ui.unmount()
 })

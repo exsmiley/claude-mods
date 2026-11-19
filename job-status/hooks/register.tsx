@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, EngineInterface } from 'claude-code'
 
-import type { RunView, RecentRow, RunningRow, Usage } from '../types'
+import type { RunView, RecentRow, RunningRow, Usage, Watch, DockerUsage, Machine } from '../types'
 
 // Live pane for long-running job runs. Any script writes one JSON file per
 // run to ~/.claude/job-status/<id>.json (protocol: README.md there); this mod
@@ -18,6 +18,11 @@ const runs = atom({ plugin: 'job-status', key: 'runs' } as const, [] as RunView[
 })
 const nowAtom = atom({ plugin: 'job-status', key: 'now' } as const, 0)
 const showOld = atom({ plugin: 'job-status', key: 'showOld' } as const, false)
+const machineAtom = atom({ plugin: 'job-status', key: 'machine' } as const, null as Machine | null, {
+  shape: 'machine-1',
+})
+const DOCKER_EVERY_MS = 10_000
+const DOCKER_RETRY_MS = 60_000
 
 // Module variables: lost on reload, which is fine (they only steer auto-open).
 const openedFor = new Set<string>()
@@ -105,23 +110,42 @@ function parseRun(name: string, text: string, mtimeMs: number): RunView {
   const lanes = num(o.lanes)
   if (lanes !== undefined) view.lanes = lanes
   if (avgJobMs !== undefined) view.avgJobMs = avgJobMs
+  if (o.watch && typeof o.watch === 'object') {
+    const w = o.watch as Record<string, unknown>
+    const strs = (v: unknown) => (Array.isArray(v) ? v.filter(x => typeof x === 'string' && x).map(String).slice(0, 50) : [])
+    const watch: Watch = {}
+    const docker = strs(w.docker)
+    if (docker.length) watch.docker = docker
+    const pids = Array.isArray(w.pids) ? w.pids.map(Number).filter(n => Number.isFinite(n) && n > 0).slice(0, 50) : []
+    if (pids.length) watch.pids = pids
+    const names = strs(w.names)
+    if (names.length) watch.names = names
+    if (watch.docker || watch.pids || watch.names) view.watch = watch
+  }
   return view
 }
 
-type ProcTable = { alive: Set<number>; kids: Map<number, number[]>; own: Map<number, { cpu: number; rssKb: number }> }
+type ProcTable = {
+  alive: Set<number>
+  kids: Map<number, number[]>
+  own: Map<number, { cpu: number; rssKb: number; comm: string }>
+  cpuAll: number
+}
 
 // One `ps` of every process per poll: liveness, and CPU / memory by subtree.
 async function procTable($: EngineInterface): Promise<ProcTable | undefined> {
   try {
-    const r = await $.process.run(['ps', '-A', '-o', 'pid=,ppid=,pcpu=,rss='], { timeoutMs: 5000 })
-    const t: ProcTable = { alive: new Set(), kids: new Map(), own: new Map() }
+    const r = await $.process.run(['ps', '-A', '-o', 'pid=,ppid=,pcpu=,rss=,comm='], { timeoutMs: 5000 })
+    const t: ProcTable = { alive: new Set(), kids: new Map(), own: new Map(), cpuAll: 0 }
     for (const line of r.stdout.split('\n')) {
-      const [a, b, c, d] = line.trim().split(/\s+/)
-      const pid = Number(a)
-      const ppid = Number(b)
-      if (!a || !Number.isFinite(pid) || !Number.isFinite(ppid)) continue
+      const m = /^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s*(.*)$/.exec(line)
+      if (!m) continue
+      const pid = Number(m[1])
+      const ppid = Number(m[2])
+      const cpu = Number(m[3]) || 0
       t.alive.add(pid)
-      t.own.set(pid, { cpu: Number(c) || 0, rssKb: Number(d) || 0 })
+      t.cpuAll += cpu
+      t.own.set(pid, { cpu, rssKb: Number(m[4]) || 0, comm: m[5] ?? '' })
       const list = t.kids.get(ppid)
       if (list) list.push(pid)
       else t.kids.set(ppid, [pid])
@@ -133,10 +157,13 @@ async function procTable($: EngineInterface): Promise<ProcTable | undefined> {
 }
 
 function usageOf(t: ProcTable, root: number): Usage | undefined {
-  if (!t.alive.has(root)) return undefined
+  return t.alive.has(root) ? usageOfRoots(t, [root]) : undefined
+}
+
+function usageOfRoots(t: ProcTable, roots: number[]): Usage {
   const u: Usage = { cpu: 0, rssKb: 0, procs: 0 }
   const seen = new Set<number>()
-  const stack = [root]
+  const stack = roots.filter(r => t.alive.has(r))
   while (stack.length) {
     const pid = stack.pop() as number
     if (seen.has(pid)) continue
@@ -163,6 +190,121 @@ async function machineMem($: EngineInterface): Promise<number | undefined> {
     // not macOS: leave the scale out
   }
   return machineMemKb
+}
+
+let cores: number | undefined
+async function cpuCores($: EngineInterface): Promise<number> {
+  if (cores !== undefined) return cores
+  try {
+    const r = await $.process.run(['sysctl', '-n', 'hw.ncpu'], { timeoutMs: 3000 })
+    cores = Number(r.stdout.trim()) || undefined
+  } catch {
+    // fall through
+  }
+  if (cores === undefined) {
+    try {
+      const r = await $.process.run(['nproc'], { timeoutMs: 3000 })
+      cores = Number(r.stdout.trim()) || 1
+    } catch {
+      cores = 1
+    }
+  }
+  return cores
+}
+
+// Memory in use on the machine: macOS vm_stat (active + wired + compressed),
+// else Linux /proc/meminfo (total - available).
+async function usedMem($: EngineInterface): Promise<number | undefined> {
+  try {
+    const r = await $.process.run(['vm_stat'], { timeoutMs: 3000 })
+    const page = Number(/page size of (\d+) bytes/.exec(r.stdout)?.[1] ?? 0)
+    const pages = (label: string) => Number(new RegExp(`${label}:\\s+(\\d+)`).exec(r.stdout)?.[1] ?? 0)
+    if (page > 0) {
+      return ((pages('Pages active') + pages('Pages wired down') + pages('Pages occupied by compressor')) * page) / 1024
+    }
+  } catch {
+    // not macOS
+  }
+  try {
+    const text = await $.fs.read('/proc/meminfo')
+    const kb = (k: string) => Number(new RegExp(`${k}:\\s+(\\d+)`).exec(text)?.[1] ?? 0)
+    const total = kb('MemTotal')
+    if (total > 0) {
+      if (machineMemKb === undefined) machineMemKb = total
+      return total - kb('MemAvailable')
+    }
+  } catch {
+    // no meminfo
+  }
+  return undefined
+}
+
+type DockerRow = { name: string; cpu: number; rssKb: number }
+let dockerRows: DockerRow[] | undefined
+let dockerAt = 0
+let dockerDown = false
+let dockerInFlight: Promise<void> | undefined
+
+function memToKb(text: string): number {
+  const m = /([\d.]+)\s*([KMGT]?i?B)/i.exec(text)
+  if (!m) return 0
+  const n = Number(m[1]) || 0
+  const unit = (m[2] ?? 'B').toUpperCase()
+  const pow: Record<string, number> = { B: 0, KB: 1, KIB: 1, MB: 2, MIB: 2, GB: 3, GIB: 3, TB: 4, TIB: 4 }
+  const base = unit.includes('I') ? 1024 : 1000
+  return (n * base ** (pow[unit] ?? 0)) / 1024
+}
+
+// `docker stats` takes ~2 s, so it runs on its own slower cadence and the
+// poll uses the last sample.
+function refreshDocker($: EngineInterface, now: number): void {
+  if (dockerInFlight) return
+  if (now - dockerAt < (dockerDown ? DOCKER_RETRY_MS : DOCKER_EVERY_MS)) return
+  dockerInFlight = (async () => {
+    try {
+      const r = await $.process.run(['docker', 'stats', '--no-stream', '--format', '{{json .}}'], { timeoutMs: 15000 })
+      if (r.exitCode !== 0) throw new Error('docker stats failed')
+      const rows: DockerRow[] = []
+      for (const line of r.stdout.split('\n')) {
+        if (!line.trim()) continue
+        try {
+          const o = JSON.parse(line) as Record<string, string>
+          rows.push({
+            name: String(o.Name ?? ''),
+            cpu: Number(String(o.CPUPerc ?? '0').replace('%', '')) || 0,
+            rssKb: memToKb(String(o.MemUsage ?? '').split('/')[0] ?? ''),
+          })
+        } catch {
+          // skip a bad line
+        }
+      }
+      dockerRows = rows
+      dockerDown = false
+    } catch {
+      dockerRows = undefined
+      dockerDown = true
+    } finally {
+      dockerAt = await $.clock.now()
+      dockerInFlight = undefined
+    }
+  })()
+}
+
+function globToRegExp(pattern: string): RegExp {
+  const esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')
+  return pattern.includes('*') ? new RegExp(`^${esc}$`) : new RegExp(esc)
+}
+
+function dockerUsageOf(rows: DockerRow[], patterns: string[]): DockerUsage {
+  const res = patterns.map(globToRegExp)
+  const u: DockerUsage = { cpu: 0, rssKb: 0, count: 0 }
+  for (const row of rows) {
+    if (!res.some(re => re.test(row.name))) continue
+    u.cpu += row.cpu
+    u.rssKb += row.rssKb
+    u.count++
+  }
+  return u
 }
 
 // Peak memory per run, for this session (module memory: a reload resets it).
@@ -211,10 +353,19 @@ async function pollOnce($: EngineInterface) {
         r.staleReason = `no update for ${fmtDur(now - r.updatedAtMs)}`
       }
       if (table && r.pid !== undefined && !r.isStale) {
-        const u = usageOf(table, r.pid)
-        if (u) {
+        const roots = [r.pid, ...(r.watch?.pids ?? [])]
+        if (r.watch?.names?.length) {
+          const names = r.watch.names
+          for (const [pid, o] of table.own) {
+            if (names.some(n => o.comm.includes(n))) roots.push(pid)
+          }
+        }
+        const u = usageOfRoots(table, roots)
+        if (u.procs > 0) {
           r.usage = u
-          const peak = Math.max(peaks.get(r.id) ?? 0, u.rssKb)
+          if (r.watch?.docker && dockerRows) r.dockerUsage = dockerUsageOf(dockerRows, r.watch.docker)
+          const total = u.rssKb + (r.dockerUsage?.rssKb ?? 0)
+          const peak = Math.max(peaks.get(r.id) ?? 0, total)
           peaks.set(r.id, peak)
           r.peakRssKb = peak
         }
@@ -226,9 +377,25 @@ async function pollOnce($: EngineInterface) {
         }
       }
     }
+    const isLive = active.some(r => !r.isStale)
+    let machine: Machine | null = null
+    if (isLive) {
+      refreshDocker($, now)
+      if (table) {
+        const n = await cpuCores($)
+        machine = { cpu: table.cpuAll, cores: n }
+        const used = await usedMem($)
+        if (used !== undefined) machine.usedKb = used
+        if (memKb !== undefined) machine.totalKb = memKb
+        else if (machineMemKb !== undefined) machine.totalKb = machineMemKb
+        if (dockerRows) machine.docker = dockerUsageOf(dockerRows, ['*'])
+        if (dockerDown) machine.isDockerUnavailable = true
+      }
+    }
     list.sort((a, b) => b.startedAtMs - a.startedAtMs)
     await update($, runs, () => list)
     await update($, nowAtom, () => now)
+    await update($, machineAtom, () => machine)
 
     // Open the pane on its own once per new live run.
     for (const r of active) {
@@ -317,6 +484,7 @@ export const register: Register = on => {
     const list = await read($, runs)
     const now = (await read($, nowAtom)) || Date.now()
     const isShowingOld = await read($, showOld)
+    const machine = await read($, machineAtom)
     const cols = Math.max(20, e.props.bodyColumns ?? 60)
 
     if (list.length === 0) {
@@ -395,17 +563,33 @@ export const register: Register = on => {
             {r.state === 'running' ? `  ·  updated ${fmtDur(now - r.updatedAtMs)} ago` : ''}
           </Text>
           {r.usage && (
-            <Text>
-              <Text color="subtle">{`CPU ${fmtCpu(r.usage.cpu)}`}</Text>
-              <Text color={memColor(r.usage.rssKb, r.machineMemKb)}>
-                {`  ·  RAM ${fmtMem(r.usage.rssKb)}`}
-                {r.machineMemKb ? ` of ${fmtMem(r.machineMemKb)}` : ''}
+            <Box flexDirection="column">
+              <Text color="subtle">
+                {`${r.dockerUsage ? 'Run ' : ''}CPU ${fmtCpu(r.usage.cpu)}  ·  RAM ${fmtMem(r.usage.rssKb)}  ·  ${r.usage.procs} proc${r.usage.procs === 1 ? '' : 's'}`}
               </Text>
-              <Text dimColor>
-                {r.peakRssKb && r.peakRssKb > r.usage.rssKb ? `  ·  peak ${fmtMem(r.peakRssKb)}` : ''}
-                {`  ·  ${r.usage.procs} proc${r.usage.procs === 1 ? '' : 's'}`}
+              {r.dockerUsage && (
+                <Text color="subtle">
+                  {`Docker CPU ${fmtCpu(r.dockerUsage.cpu)}  ·  RAM ${fmtMem(r.dockerUsage.rssKb)}  ·  ${r.dockerUsage.count} container${r.dockerUsage.count === 1 ? '' : 's'}`}
+                </Text>
+              )}
+              <Text>
+                <Text bold={!!r.dockerUsage}>
+                  {r.dockerUsage ? `Total CPU ${fmtCpu(r.usage.cpu + r.dockerUsage.cpu)}  ·  ` : ''}
+                </Text>
+                <Text bold={!!r.dockerUsage} color={memColor(r.usage.rssKb + (r.dockerUsage?.rssKb ?? 0), r.machineMemKb)}>
+                  {r.dockerUsage ? `RAM ${fmtMem(r.usage.rssKb + r.dockerUsage.rssKb)}` : ''}
+                  {r.dockerUsage && r.machineMemKb ? ` of ${fmtMem(r.machineMemKb)}` : ''}
+                </Text>
+                <Text dimColor>
+                  {r.peakRssKb ? `${r.dockerUsage ? '  ·  ' : ''}peak ${fmtMem(r.peakRssKb)}` : ''}
+                </Text>
               </Text>
-            </Text>
+              {!r.watch?.docker && machine?.docker && machine.docker.count > 0 && (
+                <Text dimColor size="footnote" wrap="truncate-end">
+                  {`${machine.docker.count} Docker container${machine.docker.count === 1 ? '' : 's'} running (CPU ${fmtCpu(machine.docker.cpu)}, RAM ${fmtMem(machine.docker.rssKb)}) not counted: add watch.docker`}
+                </Text>
+              )}
+            </Box>
           )}
 
           {!isCompact && r.state === 'running' && !r.isStale && r.running.length > 0 && (
@@ -465,6 +649,19 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
+        {machine && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Text dimColor>
+              {`Machine  CPU ${Math.round(machine.cpu / Math.max(1, machine.cores))}% of ${machine.cores} cores`}
+              {machine.usedKb !== undefined ? `  ·  RAM ${fmtMem(machine.usedKb)}${machine.totalKb ? ` of ${fmtMem(machine.totalKb)}` : ''} used` : ''}
+            </Text>
+            {machine.docker && machine.docker.count > 0 && (
+              <Text dimColor>
+                {`Docker   ${machine.docker.count} containers  ·  CPU ${fmtCpu(machine.docker.cpu)}  ·  RAM ${fmtMem(machine.docker.rssKb)}`}
+              </Text>
+            )}
+          </Box>
+        )}
         {fresh.map(r => drawRun(r, r.state !== 'running'))}
         {fresh.length === 0 && <Text dimColor>No live or recent runs.</Text>}
         {old.length > 0 && (

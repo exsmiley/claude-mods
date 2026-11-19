@@ -35,7 +35,7 @@ It reads runs through `gh` (signed in with access to the repo) and `python3`. Mi
 
 ## job-status
 
-A live pane for long-running background runs (test sweeps, screenshot comparisons, benchmarks): for each run, newest first, its state, a progress bar, counts by status (ok / skip / diff / fail), elapsed time and ETA, the jobs in flight with how long each has run (slow ones flagged), the latest results with diffs and failures highlighted, and the CPU and memory the run's processes use right now (with the peak). A run whose process is gone, or that stopped writing, is marked stale; finished runs older than a day fold away. Open it with `/job-status`; it also opens by itself when a new run starts.
+A live pane for long-running background runs (test sweeps, screenshot comparisons, benchmarks): for each run, newest first, its state, a progress bar, counts by status (ok / skip / diff / fail), elapsed time and ETA, the jobs in flight with how long each has run (slow ones flagged), the latest results with diffs and failures highlighted, and the CPU and memory the run uses right now, including Docker containers it declares (a local Supabase stack, say), with the peak and a machine-wide line for scale. A run whose process is gone, or that stopped writing, is marked stale; finished runs older than a day fold away. Open it with `/job-status`; it also opens by itself when a new run starts.
 
 Any script can feed it: write one JSON file per run to `~/.claude/job-status/<run-id>.json` (format in [job-status/helper/PROTOCOL.md](job-status/helper/PROTOCOL.md)), or from Node use the helper:
 
