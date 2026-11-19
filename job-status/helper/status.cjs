@@ -22,6 +22,20 @@ function safeId(id) {
   return String(id).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120) || 'run'
 }
 
+// The git checkout and branch a folder is on, or {} outside git.
+function gitInfo(dir) {
+  try {
+    const out = require('child_process').execFileSync(
+      'git', ['-C', dir, 'rev-parse', '--show-toplevel', '--abbrev-ref', 'HEAD'],
+      { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' },
+    )
+    const [root, branch] = out.trim().split('\n')
+    return root ? { root, ...(branch && branch !== 'HEAD' ? { branch } : {}) } : {}
+  } catch {
+    return {}
+  }
+}
+
 function mergeWatch(a, b) {
   const out = {}
   for (const k of ['docker', 'pids', 'names']) {
@@ -76,6 +90,11 @@ function createStatus(opts = {}) {
   if (host) session.hostId = String(host)
   if (sid) session.id = String(sid)
   if (Object.keys(session).length) s.session = session
+  // The checkout and branch it runs on, so the pane can clear the run once that
+  // branch's pull request is merged or closed. opts.pr names the PR outright.
+  const git = { ...gitInfo(opts.gitDir || s.cwd), ...(opts.git || {}) }
+  if (git.root) s.git = git
+  if (opts.pr) s.pr = String(opts.pr)
   if (opts.counts) Object.assign(s.counts, opts.counts)
   // Optional extras for the run's CPU / RAM, beyond what the pane finds on its
   // own: { docker: ['supabase_*'], pids: [1234], names: ['postgres'] }.

@@ -33,7 +33,9 @@ export type Machine = {
   isDockerUnavailable?: boolean
   apps?: AppUsage[]
 }
-export type RunningRow = { label: string; startedAt: string; pid?: number; usage?: Usage }
+/** A run's pull request as `gh` last saw it. */
+export type PrInfo = { state: 'OPEN' | 'MERGED' | 'CLOSED' | 'NONE'; number?: number; url?: string }
+export type RunningRow ={ label: string; startedAt: string; pid?: number; usage?: Usage }
 
 /** One run as the pane draws it: the file's fields plus what the poll found. */
 export type RunView = {
@@ -60,6 +62,12 @@ export type RunView = {
   watch?: Watch
   /** the Claude session that started the run: desktop `local_…` id and Claude Code session id */
   session?: { hostId?: string; id?: string }
+  /** the checkout and branch it ran on, for finding its PR */
+  git?: { root?: string; branch?: string }
+  /** its PR outright: a URL, or a number looked up in git.root */
+  pr?: string
+  /** that PR as `gh` last saw it, set by the poll */
+  prInfo?: PrInfo
   /** pid gone or updatedAt too old while the file still says running */
   isStale: boolean
   staleReason?: string

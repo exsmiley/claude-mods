@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register, EngineInterface } from 'claude-code'
 
 import type { RunView, RecentRow, RunningRow, Watch, Machine } from '../types'
+import { isPrDone, prFor, refreshPrs } from './prs'
 import {
   attribute,
   cpuCores,
@@ -181,6 +182,17 @@ function parseRun(name: string, text: string, mtimeMs: number): RunView {
     if (typeof so.id === 'string' && /^[A-Za-z0-9-]{1,64}$/.test(so.id)) session.id = so.id
     if (session.hostId || session.id) view.session = session
   }
+  if (o.git && typeof o.git === 'object') {
+    const g = o.git as Record<string, unknown>
+    const git: { root?: string; branch?: string } = {}
+    if (typeof g.root === 'string' && g.root.startsWith('/')) git.root = g.root
+    // a branch name gh is handed as one argument; refuse anything option-like
+    if (typeof g.branch === 'string' && /^[A-Za-z0-9._/@+-]{1,200}$/.test(g.branch) && !g.branch.startsWith('-')) git.branch = g.branch
+    if (git.root) view.git = git
+  }
+  if ((typeof o.pr === 'string' || typeof o.pr === 'number') && /^(https:\/\/[^\s]{1,300}|#?\d{1,9})$/.test(String(o.pr))) {
+    view.pr = String(o.pr).replace(/^#/, '')
+  }
   if (Array.isArray(o.dirs)) {
     const dirs = o.dirs.filter(d => typeof d === 'string' && d).map(String).slice(0, 20)
     if (dirs.length) view.dirs = dirs
@@ -301,9 +313,22 @@ async function pollOnce($: EngineInterface) {
       if (vm) machine.dockerVm = vm
       if (docker.isDown()) machine.isDockerUnavailable = true
     }
-    // Finished runs a week old leave the pane on their own.
-    const expired = list.filter(r => isClearable(r) && now - (r.endedAtMs ?? r.updatedAtMs) > AUTO_CLEAR_MS)
+    // Finished runs leave the pane on their own a week on, or once their
+    // branch's pull request is merged or closed.
+    const finished = list.filter(isClearable)
+    refreshPrs($, finished, now)
+    for (const r of finished) {
+      const pr = prFor(r)
+      if (pr && pr.state !== 'NONE') r.prInfo = pr
+    }
+    const merged = finished.filter(r => isPrDone(r.prInfo))
+    const expired = finished.filter(r => isPrDone(r.prInfo) || now - (r.endedAtMs ?? r.updatedAtMs) > AUTO_CLEAR_MS)
     const cleared = expired.length ? await moveToCleared($, expired.flatMap(r => (r.fileName ? [r.fileName] : []))) : []
+    for (const r of merged) {
+      if (r.fileName && cleared.includes(r.fileName)) {
+        $.ui.toast(`Cleared "${r.title}": PR${r.prInfo?.number ? ` #${r.prInfo.number}` : ''} ${r.prInfo?.state === 'MERGED' ? 'merged' : 'closed'}`)
+      }
+    }
     const shown = list.filter(r => !r.fileName || !cleared.includes(r.fileName))
     shown.sort((a, b) => b.startedAtMs - a.startedAtMs)
     await update($, runs, () => shown)
@@ -448,8 +473,11 @@ export const register: Register = on => {
             <Text bold wrap="truncate-end">{r.title}</Text>
             <Text color={stateColor} bold>{stateText}</Text>
           </Box>
-          {(r.session || isClearable(r)) && (
+          {(r.session || isClearable(r) || r.prInfo) && (
             <Box flexDirection="row" gap={2}>
+              {r.prInfo && (
+                <Text dimColor size="footnote">{`PR${r.prInfo.number ? ` #${r.prInfo.number}` : ''} ${r.prInfo.state.toLowerCase()}`}</Text>
+              )}
               {r.session?.hostId ? (
                 // The desktop pane only follows https links, so ask macOS to open
                 // the app's own deep link, which switches to that session.

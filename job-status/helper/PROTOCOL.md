@@ -32,6 +32,8 @@ folder, then `rename` it over the real file. Files starting with `.` are ignored
     "hostId": "local_…",                //   desktop app session ($CLAUDE_CODE_HOST_SESSION_ID): the title links to it
     "id": "…"                           //   Claude Code session ($CLAUDE_CODE_SESSION_ID): shown for `claude --resume`
   },
+  "git": { "root": "/path/to/checkout", "branch": "zach/topic" }, // optional: cleared once that branch's PR merges
+  "pr": "https://github.com/owner/repo/pull/12", // optional: the PR outright (URL, or number with git.root)
   "watch": {                            // optional extras; rarely needed (see below)
     "docker": ["supabase_*_my-stack"],  //   containers by name; `*` wildcard, no `*` = substring
     "pids": [23456],                    //   other process roots
@@ -56,7 +58,12 @@ one line.
 **Clearing.** A finished or stale run has a **✕ clear** button. When there are
 several, **✕ clear N finished runs** clears them all, and so does
 `/job-status clear`. Finished runs are also cleared on their own once they are
-a week old. Clearing moves the file into `.cleared/` in this folder, which the
+a week old, or as soon as their **pull request is merged or closed**: for a
+finished run with `pr`, or with `git` on a branch other than main / master,
+the pane asks `gh` (signed in, run in `git.root`) every 5 minutes, and shows
+the PR's number and state beside the run. It only reads; a branch with an open
+PR, or none, stays. The helper fills `git` from the folder it runs in.
+Clearing moves the file into `.cleared/` in this folder, which the
 pane skips. Nothing is deleted: move a file back to bring its run back, and
 empty `.cleared/` yourself when you like. A live run can't be cleared, since its
 writer would just write it again.

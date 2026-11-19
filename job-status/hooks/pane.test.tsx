@@ -63,6 +63,8 @@ const OPENED: string[] = []
 /** the run files the world holds; `mv` takes them out */
 let FILES: Record<string, unknown> = {}
 const MOVED: string[][] = []
+/** gh calls the pane made */
+const GH: string[][] = []
 
 const host = (procs: P[]) => (_: unknown, e: unknown) => {
   const argv = (e as { argv: string[] }).argv
@@ -78,6 +80,15 @@ const host = (procs: P[]) => (_: unknown, e: unknown) => {
       MOVED.push(argv.slice(2))
       for (const src of argv.slice(2, -1)) delete FILES[src.split('/').pop() ?? '']
       return out('')
+    }
+    case 'gh': {
+      GH.push(argv)
+      const branch = argv[argv.indexOf('--head') + 1]
+      const prs: Record<string, unknown[]> = {
+        'zach/merged': [{ state: 'CLOSED', number: 11 }, { state: 'MERGED', number: 12, url: 'https://github.com/o/r/pull/12' }],
+        'zach/open': [{ state: 'OPEN', number: 13 }],
+      }
+      return out(JSON.stringify(prs[branch ?? ''] ?? []))
     }
     case 'open':
       OPENED.push(argv[1] ?? '')
@@ -243,5 +254,31 @@ test('finished runs clear from the pane, by hand or after a week', async ($, on)
   const r = await $.command.run({ ...RUN, args: 'clear' })
   expect(r).toMatchObject({ text: 'Cleared 1 finished run(s) into ~/.claude/job-status/.cleared.' })
   expect(Object.keys(FILES)).toEqual(['live.json'])
+  await ui.unmount()
+})
+
+test('a finished run clears once its branch\'s PR is merged; open PRs and live runs stay', async ($, on) => {
+  const done = { ...live, state: 'done', endedAt: iso(60_000), running: [] }
+  const files = {
+    'merged.json': { ...done, id: 'merged', title: 'Merged run', git: { root: '/work/proj', branch: 'zach/merged' } },
+    'open.json': { ...done, id: 'open', title: 'Open run', git: { root: '/work/proj', branch: 'zach/open' } },
+    'onmain.json': { ...done, id: 'onmain', title: 'Main run', git: { root: '/work/proj', branch: 'main' } },
+    'live.json': { ...live, git: { root: '/work/proj', branch: 'zach/merged' } },
+  }
+  world(on as never, files, PROCS)
+  GH.length = 0
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.command.run(RUN) // starts the lookups
+  await $.command.run(RUN) // acts on them
+
+  // gh is asked only about finished runs on their own branches, in their checkout
+  expect(GH.map(a => a[a.indexOf('--head') + 1]).sort()).toEqual(['zach/merged', 'zach/open'])
+  expect(MOVED).toEqual([['/home/u/.claude/job-status/merged.json', '/home/u/.claude/job-status/.cleared/']])
+  expect(Object.keys(FILES).sort()).toEqual(['live.json', 'onmain.json', 'open.json'])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toContain('PR #13 open')
+  expect(texts.some(t => /^Merged run$/.test(t))).toBe(false)
   await ui.unmount()
 })
