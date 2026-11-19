@@ -28,6 +28,10 @@ folder, then `rename` it over the real file. Files starting with `.` are ignored
   "finishedJobs": 410, "totalJobMs": 34440000, // optional: for the average job time (skips excluded)
   "cwd": "…", "logFile": "…",           // optional; their folders help find the run's processes
   "dirs": ["/path/to/runner/folder"],   // optional: processes whose command line names one count
+  "session": {                          // optional: the Claude session that started the run
+    "hostId": "local_…",                //   desktop app session ($CLAUDE_CODE_HOST_SESSION_ID): the title links to it
+    "id": "…"                           //   Claude Code session ($CLAUDE_CODE_SESSION_ID): shown for `claude --resume`
+  },
   "watch": {                            // optional extras; rarely needed (see below)
     "docker": ["supabase_*_my-stack"],  //   containers by name; `*` wildcard, no `*` = substring
     "pids": [23456],                    //   other process roots
@@ -38,6 +42,12 @@ folder, then `rename` it over the real file. Files starting with `.` are ignored
 
 Done = sum of `counts`. Status strings are free-form, lowercase; `ok`, `skip`,
 `diff`, `fail` are coloured (diff = warning, fail/error = red).
+
+With `session.hostId` the pane shows an **open session ↗** link under the
+run's title, which switches the Claude desktop app to the session that started
+the run (`claude://code/continue?session=<hostId>`). With only `session.id` it
+shows the `claude --resume <id>` command instead. The helper fills both from the
+environment that Claude Code gives every command it runs.
 
 The pane marks a `running` run **stale** when its `pid` no longer exists or
 `updatedAt` is more than 90 s old. Finished runs older than a day collapse into

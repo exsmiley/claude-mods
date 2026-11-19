@@ -58,6 +58,9 @@ const CONNECTS: Record<number, string> = {
   9000: 'Claude 9000 u 32u IPv4 0x6 0t0 TCP 127.0.0.1:50002->127.0.0.1:4061 (ESTABLISHED)',
 }
 
+/** deep links the pane asked macOS to open */
+const OPENED: string[] = []
+
 const host = (procs: P[]) => (_: unknown, e: unknown) => {
   const argv = (e as { argv: string[] }).argv
   const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '' } })
@@ -68,6 +71,9 @@ const host = (procs: P[]) => (_: unknown, e: unknown) => {
         : out(procs.map(p => ` ${p.pid} ${p.cmd ?? p.comm}`).join('\n'))
     case 'sysctl':
       return out(argv[2] === 'hw.ncpu' ? '8\n' : '17179869184\n')
+    case 'open':
+      OPENED.push(argv[1] ?? '')
+      return out('')
     case 'vm_stat':
       return out(VM_STAT)
     case 'docker':
@@ -98,8 +104,9 @@ const live = {
     { label: 'grp/c@site', status: 'fail', detail: 'Timeout', at: iso(30_000) },
   ],
   notes: ['11:59:00 lane 2 restarted'],
+  session: { hostId: 'local_abc-123', id: 'cafe-0001' },
 }
-const dead = { ...live, id: 'dead', title: 'Dead run', pid: 999, startedAt: iso(900_000) }
+const dead = { ...live, id: 'dead', title: 'Dead run', pid: 999, startedAt: iso(900_000), session: { id: 'beef-0002', hostId: 'not a desktop id' } }
 const old = {
   ...live, id: 'old', title: 'Old run', state: 'done', pid: 1,
   startedAt: iso(3 * 86_400_000), updatedAt: iso(2 * 86_400_000), endedAt: iso(2 * 86_400_000),
@@ -120,12 +127,14 @@ function world(on: (event: string, hook: (...a: never[]) => unknown) => unknown,
   on('process.run', host(procs) as never)
 }
 
+const RUN = { command: 'job-status', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as const
+
 test('a run counts its detached jobs, the dev server they use, and that server\'s Docker stack', async ($, on) => {
   world(on as never, { 'live.json': live, 'dead.json': dead, 'old.json': old }, PROCS)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   // first poll starts docker sampling; the next ones use it
-  await $.command.run({ command: 'job-status', args: '' })
-  await $.command.run({ command: 'job-status', args: '' })
+  await $.command.run(RUN)
+  await $.command.run(RUN)
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
@@ -133,6 +142,13 @@ test('a run counts its detached jobs, the dev server they use, and that server\'
     const has = (re: RegExp) => expect(texts.some(t => re.test(t))).toBe(true)
 
     has(/^Screenshot compare$/)
+    // the live run links to its desktop session; the dead one has only a CLI id
+    const opens = (await ui.findAll({ type: 'Button' })).filter(b => /open session/.test(b.text ?? ''))
+    expect(opens).toHaveLength(1)
+    OPENED.length = 0
+    await ui.press({ key: 'open-live' })
+    expect(OPENED).toEqual(['claude://code/continue?session=local_abc-123'])
+    has(/^claude --resume beef-0002$/)
     has(/pid 999 is gone/)
     has(/In flight \(2\)/)
     has(/⚠ grp\/slow@site/)
@@ -168,7 +184,7 @@ test('a file status.cjs wrote renders live', async ($, on) => {
     { pid: REAL.pid, ppid: 1, pgid: REAL.pid, cpu: 12.5, rss: 51200, comm: '/usr/local/bin/node', cmd: 'node demo.cjs' },
   ], at)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.command.run({ command: 'job-status', args: '' })
+  await $.command.run(RUN)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts).toContain('running')
@@ -186,8 +202,8 @@ test('two live processes writing one id are called out', async ($, on) => {
   Object.defineProperty(files, 'flip.json', { enumerable: true, get: () => (reads++ % 2 ? older : newer) })
   world(on as never, files, PROCS)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.command.run({ command: 'job-status', args: '' })
-  await $.command.run({ command: 'job-status', args: '' })
+  await $.command.run(RUN)
+  await $.command.run(RUN)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts.some(t => /^⚠ 2 live processes write this file \(pids \d+, \d+\); .* Stop the older one \(pid 4242\)\.$/.test(t))).toBe(true)

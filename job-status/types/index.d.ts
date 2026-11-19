@@ -56,6 +56,8 @@ export type RunView = {
   /** folders whose processes belong to the run (helper: cwd and the script's folder) */
   dirs?: string[]
   watch?: Watch
+  /** the Claude session that started the run: desktop `local_…` id and Claude Code session id */
+  session?: { hostId?: string; id?: string }
   /** pid gone or updatedAt too old while the file still says running */
   isStale: boolean
   staleReason?: string

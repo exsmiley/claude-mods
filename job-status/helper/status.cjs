@@ -68,6 +68,14 @@ function createStatus(opts = {}) {
     finishedJobs: 0,
     totalJobMs: 0,
   }
+  // The Claude session that started the run, so the pane can link back to it.
+  // Claude Code puts these in every command's environment; absent elsewhere.
+  const session = {}
+  const host = (opts.session && opts.session.hostId) || process.env.CLAUDE_CODE_HOST_SESSION_ID
+  const sid = (opts.session && opts.session.id) || process.env.CLAUDE_CODE_SESSION_ID
+  if (host) session.hostId = String(host)
+  if (sid) session.id = String(sid)
+  if (Object.keys(session).length) s.session = session
   if (opts.counts) Object.assign(s.counts, opts.counts)
   // Optional extras for the run's CPU / RAM, beyond what the pane finds on its
   // own: { docker: ['supabase_*'], pids: [1234], names: ['postgres'] }.

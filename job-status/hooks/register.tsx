@@ -52,6 +52,16 @@ const num = (v: unknown): number | undefined =>
   typeof v === 'number' && Number.isFinite(v) ? v : undefined
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : v == null ? d : String(v))
 
+/** Switch the desktop app to the session that started a run. */
+async function openSession($: EngineInterface, hostId: string) {
+  try {
+    const r = await $.process.run(['open', `claude://code/continue?session=${hostId}`], { timeoutMs: 5000 })
+    if (r.exitCode !== 0) $.ui.toast(`Couldn't open that session (open exited ${r.exitCode}).`)
+  } catch (err) {
+    $.ui.toast(`Couldn't open that session: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 function parseRun(name: string, text: string, mtimeMs: number): RunView {
   const id = name.replace(/\.json$/, '')
   let o: Record<string, unknown>
@@ -124,6 +134,14 @@ function parseRun(name: string, text: string, mtimeMs: number): RunView {
   if (avgJobMs !== undefined) view.avgJobMs = avgJobMs
   if (typeof o.cwd === 'string' && o.cwd) view.cwd = o.cwd
   if (typeof o.logFile === 'string' && o.logFile) view.logFile = o.logFile
+  if (o.session && typeof o.session === 'object') {
+    const so = o.session as Record<string, unknown>
+    const session: { hostId?: string; id?: string } = {}
+    // Only ids the app's deep link accepts; anything else would make a broken link.
+    if (typeof so.hostId === 'string' && /^local_[A-Za-z0-9-]{1,64}$/.test(so.hostId)) session.hostId = so.hostId
+    if (typeof so.id === 'string' && /^[A-Za-z0-9-]{1,64}$/.test(so.id)) session.id = so.id
+    if (session.hostId || session.id) view.session = session
+  }
   if (Array.isArray(o.dirs)) {
     const dirs = o.dirs.filter(d => typeof d === 'string' && d).map(String).slice(0, 20)
     if (dirs.length) view.dirs = dirs
@@ -381,6 +399,15 @@ export const register: Register = on => {
             <Text bold wrap="truncate-end">{r.title}</Text>
             <Text color={stateColor} bold>{stateText}</Text>
           </Box>
+          {r.session?.hostId ? (
+            // The desktop pane only follows https links, so ask macOS to open
+            // the app's own deep link, which switches to that session.
+            <Button key={`open-${r.id}`} plain onPress={() => openSession($, r.session!.hostId!)}>
+              open session ↗
+            </Button>
+          ) : r.session?.id ? (
+            <Text dimColor size="footnote">{`claude --resume ${r.session.id}`}</Text>
+          ) : null}
           {r.isStale && r.staleReason && <Text color="error" size="footnote">{r.staleReason}</Text>}
           {r.writerConflict && <Text color="warning" size="footnote">{`⚠ ${r.writerConflict}`}</Text>}
           {r.error && <Text color="error">{r.error}</Text>}
