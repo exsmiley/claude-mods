@@ -57,12 +57,20 @@ function createStatus(opts = {}) {
     lanes: opts.lanes || null,
     cwd: opts.cwd || process.cwd(),
     logFile: opts.logFile || null,
+    // Folders whose processes belong to the run: the pane counts any process
+    // whose command line names one, so detached workers are found too.
+    dirs: [...new Set([
+      ...[].concat(opts.dirs || []),
+      ...[require.main && require.main.filename, process.argv[1]]
+        .filter(f => typeof f === 'string' && path.isAbsolute(f))
+        .map(f => path.dirname(f)),
+    ])],
     finishedJobs: 0,
     totalJobMs: 0,
   }
   if (opts.counts) Object.assign(s.counts, opts.counts)
-  // What else the run's CPU / RAM should include: { docker: ['supabase_*'],
-  // pids: [1234], names: ['postgres'] }. See README.md.
+  // Optional extras for the run's CPU / RAM, beyond what the pane finds on its
+  // own: { docker: ['supabase_*'], pids: [1234], names: ['postgres'] }.
   if (opts.watch) s.watch = mergeWatch({}, opts.watch)
   let ended = false
 

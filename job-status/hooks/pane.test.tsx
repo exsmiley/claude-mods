@@ -7,9 +7,9 @@ const PANE = {
   props: {
     title: 'Job status',
     isFocused: false,
-    bodyColumns: 50,
+    bodyColumns: 60,
     placement: 'dock',
-    scroll: { offset: 0, bodyRows: 40 },
+    scroll: { offset: 0, bodyRows: 60 },
     view: {},
   },
 } as const
@@ -17,13 +17,79 @@ const PANE = {
 const NOW = Date.parse('2026-11-18T12:00:00Z')
 const iso = (agoMs: number) => new Date(NOW - agoMs).toISOString()
 
+// A machine like the one this was built on: the status file is written by a
+// small watcher (4242) that has no children; the runner (6000) and its job
+// processes are detached from it but name the run's folder; the jobs talk
+// to a dev server (7000, parent pid 1) on :3051, which talks to a Supabase
+// stack in Docker on :54321. 8000 and the other stack are someone else's.
+type P = { pid: number; ppid: number; pgid: number; cpu: number; rss: number; comm: string; cmd?: string }
+const PROCS: P[] = [
+  { pid: 1, ppid: 0, pgid: 1, cpu: 0, rss: 1000, comm: '/sbin/launchd' },
+  { pid: 4242, ppid: 1, pgid: 4241, cpu: 1, rss: 51200, comm: '/usr/local/bin/node', cmd: 'node -e require(process.argv[1]) /work/scen/status-watch.cjs' },
+  { pid: 6000, ppid: 900, pgid: 6000, cpu: 10, rss: 102400, comm: '/usr/local/bin/node', cmd: 'node /work/scen/final.cjs /work/scen/jobs.json /work/scen/out-final --lanes 2' },
+  { pid: 6001, ppid: 6000, pgid: 6000, cpu: 40, rss: 204800, comm: '/usr/local/bin/node', cmd: 'node /work/scen/sh-harness.cjs --b http://localhost:3051' },
+  { pid: 6002, ppid: 6001, pgid: 6002, cpu: 150, rss: 1048576, comm: '/Users/u/Library/Caches/ms-playwright/chromium/chrome-headless-shell' },
+  { pid: 7000, ppid: 1, pgid: 7000, cpu: 100, rss: 1048576, comm: '/usr/local/bin/node', cmd: 'next-server (v16.4.6)' },
+  { pid: 8000, ppid: 1, pgid: 8000, cpu: 30, rss: 512000, comm: '/usr/local/bin/node', cmd: 'node /elsewhere/app.js' },
+  { pid: 31422, ppid: 1, pgid: 31422, cpu: 120, rss: 6291456, comm: '/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine' },
+  { pid: 9000, ppid: 1, pgid: 9000, cpu: 5, rss: 600000, comm: '/Applications/Claude.app/Contents/MacOS/Claude' },
+]
+const DOCKER_STATS = [
+  { Name: 'supabase_kong_x', CPUPerc: '20.00%', MemUsage: '256MiB / 23.44GiB' },
+  { Name: 'supabase_auth_x', CPUPerc: '80.00%', MemUsage: '768MiB / 23.44GiB' },
+  { Name: 'supabase_kong_other', CPUPerc: '100.00%', MemUsage: '1GiB / 23.44GiB' },
+].map(o => JSON.stringify(o)).join('\n')
+const DOCKER_PS = [
+  { Names: 'supabase_kong_x', Ports: '0.0.0.0:54321->8000/tcp, [::]:54321->8000/tcp', Networks: 'supabase_network_x' },
+  { Names: 'supabase_auth_x', Ports: '9999/tcp', Networks: 'supabase_network_x' },
+  { Names: 'supabase_kong_other', Ports: '0.0.0.0:54581->8000/tcp', Networks: 'supabase_network_other' },
+].map(o => JSON.stringify(o)).join('\n')
+const VM_STAT = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages active:   262144.\nPages wired down:   131072.\nPages occupied by compressor:   131072.\n'
+const LISTEN = [
+  'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME',
+  'node 7000 u 20u IPv4 0x1 0t0 TCP 127.0.0.1:3051 (LISTEN)',
+  'node 8000 u 20u IPv4 0x2 0t0 TCP *:4061 (LISTEN)',
+  'com.docke 500 u 30u IPv6 0x3 0t0 TCP *:54321 (LISTEN)',
+].join('\n')
+// Who holds a connection to what, by pid.
+const CONNECTS: Record<number, string> = {
+  6001: 'node 6001 u 30u IPv4 0x4 0t0 TCP 127.0.0.1:50000->127.0.0.1:3051 (ESTABLISHED)',
+  7000: 'node 7000 u 31u IPv4 0x5 0t0 TCP 127.0.0.1:50001->127.0.0.1:54321 (ESTABLISHED)',
+  9000: 'Claude 9000 u 32u IPv4 0x6 0t0 TCP 127.0.0.1:50002->127.0.0.1:4061 (ESTABLISHED)',
+}
+
+const host = (procs: P[]) => (_: unknown, e: unknown) => {
+  const argv = (e as { argv: string[] }).argv
+  const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '' } })
+  switch (argv[0]) {
+    case 'ps':
+      return argv[3]?.includes('pgid')
+        ? out(procs.map(p => ` ${p.pid} ${p.ppid} ${p.pgid} ${p.cpu.toFixed(1)} ${p.rss} ${p.comm}`).join('\n'))
+        : out(procs.map(p => ` ${p.pid} ${p.cmd ?? p.comm}`).join('\n'))
+    case 'sysctl':
+      return out(argv[2] === 'hw.ncpu' ? '8\n' : '17179869184\n')
+    case 'vm_stat':
+      return out(VM_STAT)
+    case 'docker':
+      return out(argv[1] === 'ps' ? DOCKER_PS : DOCKER_STATS)
+    case 'lsof': {
+      if (argv.includes('-sTCP:LISTEN')) return out(LISTEN)
+      const pids = (argv[argv.indexOf('-p') + 1] ?? '').split(',').map(Number)
+      return out(['COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME', ...pids.flatMap(p => CONNECTS[p] ?? [])].join('\n'))
+    }
+    default:
+      return out('')
+  }
+}
+
 const live = {
   id: 'live', title: 'Screenshot compare', state: 'running', total: 10,
   startedAt: iso(600_000), updatedAt: iso(2_000), pid: 4242, lanes: 2,
+  cwd: '/work/proj/web', logFile: '/work/scen/out-final/final.log',
   counts: { ok: 3, skip: 1, diff: 1, fail: 1 },
   finishedJobs: 5, totalJobMs: 5 * 60_000,
   running: [
-    { label: 'grp/slow@site', startedAt: iso(300_000), pid: 4300 },
+    { label: 'grp/slow@site', startedAt: iso(300_000), pid: 6001 },
     { label: 'grp/fresh@site', startedAt: iso(10_000) },
   ],
   recent: [
@@ -32,7 +98,6 @@ const live = {
     { label: 'grp/c@site', status: 'fail', detail: 'Timeout', at: iso(30_000) },
   ],
   notes: ['11:59:00 lane 2 restarted'],
-  watch: { docker: ['supabase_*'] },
 }
 const dead = { ...live, id: 'dead', title: 'Dead run', pid: 999, startedAt: iso(900_000) }
 const old = {
@@ -40,90 +105,74 @@ const old = {
   startedAt: iso(3 * 86_400_000), updatedAt: iso(2 * 86_400_000), endedAt: iso(2 * 86_400_000),
   running: [],
 }
-const PS = [
-  '    1     0   0.0   1000 /sbin/launchd',
-  ' 4242     1 250.0 2097152 /usr/local/bin/node',
-  ' 4300  4242  50.0 1048576 /Applications/Chrome.app/Contents/MacOS/Chrome',
-].join('\n')
-const DOCKER = [
-  JSON.stringify({ Name: 'supabase_db_x', CPUPerc: '100.00%', MemUsage: '1GiB / 23.44GiB' }),
-  JSON.stringify({ Name: 'other_y', CPUPerc: '10.00%', MemUsage: '512MiB / 23.44GiB' }),
-].join('\n')
-const VM = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages active:   262144.\nPages wired down:   131072.\nPages occupied by compressor:   131072.\n'
-const host = (extraPs = '') => (_: unknown, e: unknown) => {
-  const argv = (e as { argv: string[] }).argv
-  const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '' } })
-  if (argv[0] === 'sysctl') return out(argv[2] === 'hw.ncpu' ? '8\n' : '17179869184\n')
-  if (argv[0] === 'docker') return out(DOCKER)
-  if (argv[0] === 'vm_stat') return out(VM)
-  return out(PS + extraPs + '\n')
-}
 
-const FILES: Record<string, unknown> = { 'live.json': live, 'dead.json': dead, 'old.json': old }
-
-test('the pane draws live, stale and collapsed runs', async ($, on) => {
+function world(on: (event: string, hook: (...a: never[]) => unknown) => unknown, files: Record<string, unknown>, procs: P[], now = NOW) {
   on('command.register', () => ({ value: { command: 'job-status' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('env.get', () => ({ value: '/home/u' }))
-  on('clock.now', () => ({ value: NOW }))
-  on('fs.list', () => ({
-    value: Object.keys(FILES).map(name => ({ name, kind: 'file', size: 1, mtimeMs: NOW - 5000, isLink: false })),
-  }))
-  on('fs.read', (_, e) => {
-    const name = String((e as { path: string }).path).split('/').pop() ?? ''
-    return { value: JSON.stringify(FILES[name]) }
-  })
-  on('process.run', host())
+  on('clock.now', () => ({ value: now }))
   on('clock.every', () => ({ value: {} }))
+  on('fs.list', () => ({
+    value: Object.keys(files).map(name => ({ name, kind: 'file', size: 1, mtimeMs: now - 5000, isLink: false })),
+  }))
+  on('fs.read', (_: unknown, e: { path: string }) => ({ value: JSON.stringify(files[e.path.split('/').pop() ?? '']) }))
+  on('process.run', host(procs) as never)
+}
 
+test('a run counts its detached jobs, the dev server they use, and that server\'s Docker stack', async ($, on) => {
+  world(on as never, { 'live.json': live, 'dead.json': dead, 'old.json': old }, PROCS)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  // first poll starts docker sampling; the next ones use it
   await $.command.run({ command: 'job-status', args: '' })
   await $.command.run({ command: 'job-status', args: '' })
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /^Screenshot compare$/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /pid 999 is gone/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /In flight \(2\)/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /⚠ grp\/slow@site/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /412 px differ/ }))?.text).toBeTruthy()
     const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-    expect(texts).toContain('Run CPU 300%  ·  RAM 3.0 GB  ·  2 procs')
-    expect(texts).toContain('Docker CPU 100%  ·  RAM 1.0 GB  ·  1 container')
-    expect(texts).toContain('Total CPU 400%  ·  ')
-    expect(texts).toContain('RAM 4.0 GB of 16.0 GB')
-    expect(texts.some(t => /^Machine  CPU 38% of 8 cores  ·  RAM 8\.0 GB of 16\.0 GB used$/.test(t))).toBe(true)
-    expect(texts.some(t => /^Docker   2 containers  ·  CPU 110%  ·  RAM 1\.5 GB$/.test(t))).toBe(true)
-    expect(texts.some(t => /not counted/.test(t))).toBe(false)
-    expect((await ui.find({ type: 'Text', text: /^50% 1\.0 GB$/ }))?.text).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /ETA/ }))?.text).toMatch(/elapsed 10m00s/)
-    expect(await ui.find({ type: 'Text', text: /^Old run$/ })).toBeFalsy()
-    expect(await ui.findAll({ type: 'Text', text: /In flight/ })).toHaveLength(1)
+    const has = (re: RegExp) => expect(texts.some(t => re.test(t))).toBe(true)
+
+    has(/^Screenshot compare$/)
+    has(/pid 999 is gone/)
+    has(/In flight \(2\)/)
+    has(/⚠ grp\/slow@site/)
+    has(/412 px differ/)
+    has(/elapsed 10m00s/)
+    expect(texts.some(t => /^Old run$/.test(t))).toBe(false)
+
+    // processes: the watcher, the runner tree found by folder, and the dev
+    // server found through the connection; not 8000, not Claude
+    has(/^Procs  CPU 301%  ·  RAM 2\.3 GB  ·  5 procs$/)
+    // Docker: the run's stack only, at its share of the VM (half of 120% / 6 GB)
+    has(/^Docker CPU 60%  ·  RAM 3\.0 GB  ·  2 containers  \(share of Docker VM\)$/)
+    has(/^Total  CPU 361%  ·  $/)
+    has(/^RAM 5\.3 GB of 16\.0 GB$/)
+    has(/^counted: 1 in its process tree; 3 by folder or name; 1 it connects to \(localhost:3051\); 2 containers \(supabase_network_x\)$/)
+    // a job's own process
+    has(/^190% 1\.2 GB$/)
+    // machine
+    has(/^Machine  CPU 57% of 8 cores  ·  RAM 8\.0 GB of 16\.0 GB used$/)
+    has(/^Docker   3 containers  ·  inside CPU 200%, RAM 2\.0 GB  ·  VM CPU 120%, RAM 6\.0 GB$/)
+    has(/^Docker VM$/)
     await ui.unmount()
   }
 })
 
-// A file the real status.cjs wrote mid-run (demo.cjs), pid answered as alive.
+// A file the real status.cjs wrote mid-run (demo.cjs), its pid alive.
 const REAL = {"version": 1, "id": "demo-run", "title": "Demo run (30 fake jobs)", "startedAt": "2026-11-19T01:47:31.932Z", "updatedAt": "2026-11-19T01:47:46.933Z", "state": "running", "total": 30, "counts": {"ok": 5, "skip": 0, "diff": 2, "fail": 1}, "running": [{"label": "demo/scenario-07@site-c", "startedAt": "2026-11-19T01:47:38.367Z"}, {"label": "demo/scenario-10@site-b", "startedAt": "2026-11-19T01:47:44.732Z"}, {"label": "demo/scenario-11@site-c", "startedAt": "2026-11-19T01:47:46.409Z"}, {"label": "demo/scenario-12@site-d", "startedAt": "2026-11-19T01:47:46.552Z"}], "recent": [{"label": "demo/scenario-01@site-a", "status": "diff", "at": "2026-11-19T01:47:36.033Z", "detail": "165 px differ", "ms": 4100}, {"label": "demo/scenario-02@site-b", "status": "diff", "at": "2026-11-19T01:47:38.104Z", "detail": "769 px differ", "ms": 6170}, {"label": "demo/scenario-04@site-d", "status": "ok", "at": "2026-11-19T01:47:38.367Z", "ms": 6433}, {"label": "demo/scenario-03@site-c", "status": "fail", "at": "2026-11-19T01:47:38.835Z", "detail": "Timeout waiting for canvas", "ms": 6901}, {"label": "demo/scenario-05@site-a", "status": "ok", "at": "2026-11-19T01:47:40.240Z", "ms": 4207}, {"label": "demo/scenario-09@site-a", "status": "ok", "at": "2026-11-19T01:47:44.731Z", "ms": 4490}, {"label": "demo/scenario-06@site-b", "status": "ok", "at": "2026-11-19T01:47:46.409Z", "ms": 8305}, {"label": "demo/scenario-08@site-d", "status": "ok", "at": "2026-11-19T01:47:46.552Z", "ms": 7716}], "notes": ["01:47:31 demo started on 4 lanes"], "pid": 74230, "lanes": 4, "cwd": "/x", "logFile": null, "finishedJobs": 8, "totalJobMs": 48322}
 
 test('a file status.cjs wrote renders live', async ($, on) => {
-  on('command.register', () => ({ value: { command: 'job-status' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('env.get', () => ({ value: '/home/u' }))
-  on('clock.now', () => ({ value: Date.parse(REAL.updatedAt) + 1000 }))
-  on('fs.list', () => ({ value: [{ name: 'demo-run.json', kind: 'file', size: 1, mtimeMs: Date.parse(REAL.updatedAt), isLink: false }] }))
-  on('fs.read', () => ({ value: JSON.stringify(REAL) }))
-  on('process.run', host(`\n ${REAL.pid} 1 12.5 51200 node`))
-  on('clock.every', () => ({ value: {} }))
+  const at = Date.parse(REAL.updatedAt) + 1000
+  world(on as never, { 'demo-run.json': REAL }, [
+    ...PROCS,
+    { pid: REAL.pid, ppid: 1, pgid: REAL.pid, cpu: 12.5, rss: 51200, comm: '/usr/local/bin/node', cmd: 'node demo.cjs' },
+  ], at)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  await $.command.run({ command: 'job-status', args: '' })
   await $.command.run({ command: 'job-status', args: '' })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts).toContain('running')
-  expect(texts.some(t => /^2 Docker containers running \(CPU 110%, RAM 1\.5 GB\) not counted: add watch\.docker$/.test(t))).toBe(true)
   expect(texts.some(t => /In flight \(4\)/.test(t))).toBe(true)
+  expect(texts.some(t => /^CPU 13%  ·  RAM 50 MB  ·  1 proc$/.test(t))).toBe(true)
   await ui.unmount()
 })
