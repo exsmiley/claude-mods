@@ -93,6 +93,7 @@ declare module 'claude-code' {
       now: number
       showOld: boolean
       machine: Shaped<Machine | null>
+      pollError: string | null
     }
   }
 }

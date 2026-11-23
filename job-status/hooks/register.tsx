@@ -28,6 +28,12 @@ const STALE_MS = 90_000 // no write for this long while "running" → stale
 const OLD_MS = 24 * 3600_000 // finished runs older than this are collapsed
 const AUTO_CLEAR_MS = 7 * 24 * 3600_000 // ...and cleared away after this
 const MAX_RUNS = 30
+// A poll that has not settled by now is abandoned and the next tick starts a
+// fresh one; without this one call that never answers freezes the pane and
+// every /job-status behind it.
+const POLL_TIMEOUT_MS = 45_000
+// How long /job-status waits for a poll before answering anyway.
+const COMMAND_WAIT_MS = 10_000
 
 const runs = atom({ plugin: 'job-status', key: 'runs' } as const, [] as RunView[], {
   shape: 'runs-2',
@@ -37,10 +43,16 @@ const showOld = atom({ plugin: 'job-status', key: 'showOld' } as const, false)
 const machineAtom = atom({ plugin: 'job-status', key: 'machine' } as const, null as Machine | null, {
   shape: 'machine-2',
 })
+/** Why the last poll could not read the folder or finish, for the pane to say. */
+const pollError = atom({ plugin: 'job-status', key: 'pollError' } as const, null as string | null)
 
 // Module variables: lost on reload, which is fine (they only steer auto-open).
 const openedFor = new Set<string>()
 let inFlight: Promise<void> | undefined
+let inFlightSince = 0
+// Bumped for every poll started; a poll writes only while it is the latest,
+// so one abandoned as stuck can't overwrite newer results when it settles.
+let generation = 0
 
 const toMs = (v: unknown): number | undefined => {
   if (typeof v === 'number' && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v
@@ -229,24 +241,53 @@ function noteWriter(r: RunView, now: number) {
   writers.set(r.id, seen)
 }
 
-function poll($: EngineInterface): Promise<void> {
-  inFlight ??= pollOnce($).finally(() => {
+async function poll($: EngineInterface): Promise<void> {
+  const now = await $.clock.now().catch(() => Date.now())
+  if (inFlight && now - inFlightSince > POLL_TIMEOUT_MS) {
     inFlight = undefined
-  })
+    await update($, pollError, () => `The last poll was stuck for ${fmtDur(now - inFlightSince)}; started a new one.`).catch(() => {})
+  }
+  if (!inFlight) {
+    const gen = ++generation
+    inFlightSince = now
+    const p: Promise<void> = pollOnce($, gen)
+      .catch(async err => {
+        if (gen !== generation) return
+        await update($, pollError, () => `Poll failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => {})
+      })
+      .finally(() => {
+        if (inFlight === p) inFlight = undefined
+      })
+    inFlight = p
+  }
   return inFlight
 }
 
-async function pollOnce($: EngineInterface) {
+/** Waits for a poll, but never longer than `ms`: false when it gave up. */
+async function pollWithin($: EngineInterface, ms: number): Promise<boolean> {
+  let isDone = false
+  const p = poll($).then(() => {
+    isDone = true
+  })
+  await Promise.race([p, $.clock.sleep(ms).catch(() => {})])
+  return isDone
+}
+
+async function pollOnce($: EngineInterface, gen: number) {
   {
     const home = await $.env.get('HOME')
     if (!home) return
     const dir = `${home}/.claude/job-status`
     const now = await $.clock.now()
     let entries: { name: string; kind: string; mtimeMs: number }[] = []
+    let listError: string | null = null
     try {
       entries = await $.fs.list(dir)
-    } catch {
+    } catch (err) {
       entries = []
+      // A folder not made yet is the normal empty state; anything else is said.
+      const isMissing = await $.fs.exists(dir).then(x => !x, () => false)
+      if (!isMissing) listError = `Couldn't read ${dir}: ${err instanceof Error ? err.message : String(err)}`
     }
     const files = entries
       .filter(f => f.kind === 'file' && f.name.endsWith('.json') && !f.name.startsWith('.'))
@@ -285,8 +326,9 @@ async function pollOnce($: EngineInterface) {
         r.writerConflict = `${all.length} live processes write this file (pids ${all.map(a => a[0]).join(', ')}); its numbers flip between them. Stop the older one (pid ${oldest?.[0]}).`
       }
       if (!table || r.isStale) continue
-      const found = await attribute($, table, r, home, now, vm)
-      if (found.usage.procs > 0 || found.docker) {
+      // One run's attribution failing costs that run its usage, not the poll.
+      const found = await attribute($, table, r, home, now, vm).catch(() => undefined)
+      if (found && (found.usage.procs > 0 || found.docker)) {
         r.usage = found.usage
         if (found.docker) r.dockerUsage = found.docker
         r.sources = found.sources
@@ -331,6 +373,8 @@ async function pollOnce($: EngineInterface) {
     }
     const shown = list.filter(r => !r.fileName || !cleared.includes(r.fileName))
     shown.sort((a, b) => b.startedAtMs - a.startedAtMs)
+    if (gen !== generation) return // abandoned as stuck; a newer poll owns the pane
+    await update($, pollError, () => listError)
     await update($, runs, () => shown)
     await update($, nowAtom, () => now)
     await update($, machineAtom, () => machine)
@@ -410,15 +454,22 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'job-status' }, async ($, e) => {
-    await poll($)
     if (e.args.trim() === 'clear') {
+      await pollWithin($, COMMAND_WAIT_MS)
       const n = await clearRuns($, (await read($, runs)).filter(isClearable))
       return { text: n ? `Cleared ${n} finished run(s) into ~/.claude/job-status/.cleared.` : 'No finished runs to clear.' }
     }
+    // Open first, so the pane shows up even while a poll is slow.
     await $.ui.open({ id: PANE, title: 'Job status' })
+    const isFresh = await pollWithin($, COMMAND_WAIT_MS)
     const list = await read($, runs)
     const live = list.filter(r => r.state === 'running' && !r.isStale).length
-    return { text: `Job status pane opened (${list.length} run(s), ${live} live).` }
+    const err = await read($, pollError)
+    return {
+      text: `Job status pane opened (${list.length} run(s), ${live} live).` +
+        (isFresh ? '' : ` The poll took over ${fmtDur(COMMAND_WAIT_MS)}; showing the last results.`) +
+        (err ? ` ${err}` : ''),
+    }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -427,11 +478,13 @@ export const register: Register = on => {
     const now = (await read($, nowAtom)) || Date.now()
     const isShowingOld = await read($, showOld)
     const machine = await read($, machineAtom)
+    const err = await read($, pollError)
     const cols = Math.max(20, e.props.bodyColumns ?? 60)
 
     if (list.length === 0) {
       return (
         <Box flexDirection="column">
+          {err && <Text color="error">{err}</Text>}
           <Text dimColor>No runs in ~/.claude/job-status yet.</Text>
           <Text dimColor>Scripts write status there with status.cjs (see README.md).</Text>
         </Box>
@@ -612,6 +665,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
+        {err && <Text color="error">{err}</Text>}
         {machine && (
           <Box flexDirection="column" marginBottom={1}>
             <Text dimColor>

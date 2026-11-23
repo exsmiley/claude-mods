@@ -132,20 +132,41 @@ const old = {
   running: [],
 }
 
-function world(on: (event: string, hook: (...a: never[]) => unknown) => unknown, files: Record<string, unknown>, procs: P[], now = NOW) {
+/** pane opens the mod asked for */
+let OPENS = 0
+
+type WorldOpts = {
+  /** the clock, when a test moves it */
+  clock?: () => number
+  /** answers a process.run first; undefined falls through to the host */
+  run?: (argv: string[]) => unknown
+  /** stands in for fs.list */
+  list?: () => unknown
+  /** clock.sleep returns at once; by default it never does, so /job-status waits for its poll */
+  isSleepInstant?: boolean
+}
+
+function world(on: (event: string, hook: (...a: never[]) => unknown) => unknown, files: Record<string, unknown>, procs: P[], now = NOW, opts: WorldOpts = {}) {
   FILES = files
   MOVED.length = 0
+  OPENS = 0
   on('command.register', () => ({ value: { command: 'job-status' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', () => {
+    OPENS++
+    return { value: { isPlaced: true } }
+  })
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('env.get', () => ({ value: '/home/u' }))
-  on('clock.now', () => ({ value: now }))
+  on('clock.now', () => ({ value: opts.clock ? opts.clock() : now }))
   on('clock.every', () => ({ value: {} }))
-  on('fs.list', () => ({
+  on('clock.sleep', () => (opts.isSleepInstant ? { value: undefined } : new Promise(() => {})))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', opts.list ?? (() => ({
     value: Object.keys(files).map(name => ({ name, kind: 'file', size: 1, mtimeMs: now - 5000, isLink: false })),
-  }))
+  })))
   on('fs.read', (_: unknown, e: { path: string }) => ({ value: JSON.stringify(files[e.path.split('/').pop() ?? '']) }))
-  on('process.run', host(procs) as never)
+  const fromHost = host(procs)
+  on('process.run', ((_: unknown, e: { argv: string[] }) => opts.run?.(e.argv) ?? fromHost(_, e)) as never)
 }
 
 const RUN = { command: 'job-status', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as const
@@ -280,5 +301,59 @@ test('a finished run clears once its branch\'s PR is merged; open PRs and live r
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts).toContain('PR #13 open')
   expect(texts.some(t => /^Merged run$/.test(t))).toBe(false)
+  await ui.unmount()
+})
+
+test('a poll that never settles is abandoned, and /job-status still answers', async ($, on) => {
+  let t = NOW
+  let isHung = true
+  const hung: ((v: unknown) => void)[] = []
+  world(on as never, { 'live.json': live }, PROCS, NOW, {
+    clock: () => t,
+    // ps never answers while hung: the poll it is in can't finish
+    run: argv => (argv[0] === 'ps' && isHung ? new Promise(resolve => hung.push(resolve)) : undefined),
+    isSleepInstant: true,
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  // the pane opens before the poll, and the command answers without it
+  const first = await $.command.run(RUN)
+  expect(OPENS).toBeGreaterThan(0)
+  expect(first).toMatchObject({ text: expect.stringContaining('showing the last results') })
+  // let the poll reach the ps that never answers; later commands wait on it
+  for (let i = 0; i < 50 && hung.length === 0; i++) await $.command.run(RUN)
+  expect(hung.length).toBeGreaterThan(0)
+  const stuck = await $.command.run(RUN)
+  expect(stuck).toMatchObject({ text: expect.stringContaining('showing the last results') })
+
+  // past the time limit the next poll starts over and draws the live run
+  t += 60_000
+  isHung = false
+  const isDrawn = (r: unknown) => /\(1 run\(s\), 1 live\)/.test(String((r as { text?: string }).text))
+  const abandoned = await $.command.run(RUN)
+  expect(abandoned).toMatchObject({ text: expect.stringContaining('The last poll was stuck for 1m00s; started a new one.') })
+  let last = abandoned
+  for (let i = 0; i < 50 && !isDrawn(last); i++) last = await $.command.run(RUN)
+  expect(isDrawn(last)).toBe(true)
+
+  // release the stuck calls: mounting waits while any call is pending
+  for (const resolve of hung) resolve({ value: { exitCode: 0, stdout: '', stderr: '' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(x => x.text)
+  expect(texts).toContain('Screenshot compare')
+  expect(texts).toContain('running')
+  await ui.unmount()
+})
+
+test('a folder the pane cannot read is said, not shown as empty', async ($, on) => {
+  world(on as never, {}, PROCS, NOW, {
+    list: () => ({ deny: 'EACCES: permission denied' }),
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const r = await $.command.run(RUN)
+  expect(r).toMatchObject({ text: expect.stringContaining("Couldn't read /home/u/.claude/job-status") })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(x => x.text)
+  expect(texts.some(x => /^Couldn't read \/home\/u\/\.claude\/job-status: .*EACCES/.test(x))).toBe(true)
   await ui.unmount()
 })
