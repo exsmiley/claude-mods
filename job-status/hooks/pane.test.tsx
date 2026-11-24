@@ -134,6 +134,8 @@ const old = {
 
 /** pane opens the mod asked for */
 let OPENS = 0
+/** the mod's $.store, kept across engines */
+let STORE: Record<string, unknown> = {}
 
 type WorldOpts = {
   /** the clock, when a test moves it */
@@ -142,6 +144,10 @@ type WorldOpts = {
   run?: (argv: string[]) => unknown
   /** stands in for fs.list */
   list?: () => unknown
+  /** what an earlier engine of this session stored */
+  store?: Record<string, unknown>
+  /** the engine's open panes; none in a fresh engine */
+  panes?: () => unknown[]
   /** clock.sleep returns at once; by default it never does, so /job-status waits for its poll */
   isSleepInstant?: boolean
 }
@@ -150,6 +156,7 @@ function world(on: (event: string, hook: (...a: never[]) => unknown) => unknown,
   FILES = files
   MOVED.length = 0
   OPENS = 0
+  STORE = opts.store ?? {}
   on('command.register', () => ({ value: { command: 'job-status' } }))
   on('ui.open', () => {
     OPENS++
@@ -159,6 +166,20 @@ function world(on: (event: string, hook: (...a: never[]) => unknown) => unknown,
   on('env.get', () => ({ value: '/home/u' }))
   on('clock.now', () => ({ value: opts.clock ? opts.clock() : now }))
   on('clock.every', () => ({ value: {} }))
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.attach', (_: unknown, e: { clientId: string }) => ({ clientId: e.clientId }))
+  on('ui.close', () => ({ value: undefined }))
+  on('ui.panes', () => ({ value: opts.panes?.() ?? [] }))
+  on('store.get', (_: unknown, e: { key: string }) => ({ value: STORE[e.key] }))
+  on('store.set', (_: unknown, e: { key: string; value: unknown }) => {
+    STORE[e.key] = JSON.parse(JSON.stringify(e.value))
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: Object.keys(STORE) }))
+  on('store.delete', (_: unknown, e: { key: string }) => {
+    delete STORE[e.key]
+    return { value: undefined }
+  })
   on('clock.sleep', () => (opts.isSleepInstant ? { value: undefined } : new Promise(() => {})))
   on('fs.exists', () => ({ value: true }))
   on('fs.list', opts.list ?? (() => ({
@@ -391,4 +412,43 @@ test('while another session holds the lock, docker is left alone', async ($, on)
 
 test('a stale run does not sample docker', async ($, on) => {
   expect(await dockerRuns($ as never, on as never, { 'dead.json': dead }, false)).toBe(0)
+})
+
+const DONE = { 'old.json': { ...old, updatedAt: iso(60_000), endedAt: iso(60_000) } }
+const memory = (isOpen: boolean, openedFor: string[] = []) => ({ 'pane:sess-1': { isOpen, openedFor, at: NOW - 60_000 } })
+
+test('a fresh engine reopens a pane that was open, with no live run', async ($, on) => {
+  world(on as never, DONE, PROCS, NOW, { store: memory(true) })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(OPENS).toBe(1)
+})
+
+test('a pane the person closed stays closed in a fresh engine, even with its run live', async ($, on) => {
+  world(on as never, { 'live.json': live }, PROCS, NOW, { store: memory(false, ['live']) })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.session.attach({ surface: 'desktop', clientId: 'd' })
+  await $.command.run({ ...RUN, args: 'clear' }) // waits for a poll to finish, opens nothing itself
+  expect(OPENS).toBe(0)
+})
+
+test('attaching reopens a pane the engine lost, and leaves one it has', async ($, on) => {
+  let panes: unknown[] = []
+  world(on as never, DONE, PROCS, NOW, { panes: () => panes })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(OPENS).toBe(0)
+  await $.command.run(RUN) // opens, and is remembered
+  expect(OPENS).toBe(1)
+  panes = [{ id: 'job-status', title: 'Job status', isShown: true, isFocused: false, isPlaced: true }]
+  await $.session.attach({ surface: 'desktop', clientId: 'd' })
+  expect(OPENS).toBe(1)
+  panes = []
+  await $.session.attach({ surface: 'desktop', clientId: 'd' })
+  expect(OPENS).toBe(2)
+})
+
+test('memory of a session not seen for a month is dropped', async ($, on) => {
+  world(on as never, {}, PROCS, NOW, { store: { 'pane:gone': { isOpen: true, openedFor: [], at: NOW - 40 * 86_400_000 }, ...memory(false) } })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 200 && 'pane:gone' in STORE; i++) await Promise.resolve()
+  expect(Object.keys(STORE)).toEqual(['pane:sess-1'])
 })

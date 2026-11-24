@@ -46,7 +46,8 @@ const machineAtom = atom({ plugin: 'job-status', key: 'machine' } as const, null
 /** Why the last poll could not read the folder or finish, for the pane to say. */
 const pollError = atom({ plugin: 'job-status', key: 'pollError' } as const, null as string | null)
 
-// Module variables: lost on reload, which is fine (they only steer auto-open).
+// Runs the pane already opened for. Seeded from the store at session.start, so
+// a fresh engine on the same session doesn't reopen a pane the person closed.
 const openedFor = new Set<string>()
 let inFlight: Promise<void> | undefined
 let inFlightSince = 0
@@ -384,7 +385,7 @@ async function pollOnce($: EngineInterface, gen: number) {
     for (const r of active) {
       if (!r.isStale && !openedFor.has(r.id)) {
         openedFor.add(r.id)
-        void $.ui.open({ id: PANE, title: 'Job status' })
+        void openPane($).catch(() => {})
       }
     }
   }
@@ -442,6 +443,79 @@ const STATE_COLOR: Record<string, string> = {
 }
 const COUNT_ORDER = ['ok', 'skip', 'diff', 'fail']
 
+// The desktop app ends idle engines (memory pressure, or its cap on live ones)
+// and starts a fresh one when the session is touched. The pane list lives in
+// the engine, so the new one starts with no pane: this remembers, per session,
+// whether ours was open, so waking can put it back.
+const PANE_KEEP_MS = 30 * 24 * 3600_000
+type PaneMemory = { isOpen: boolean; openedFor: string[]; at: number }
+
+async function paneMemory($: EngineInterface): Promise<PaneMemory | undefined> {
+  const v = await $.store.get(`pane:${await $.session.id()}`)
+  if (!v || typeof v !== 'object') return undefined
+  const m = v as Partial<PaneMemory>
+  return {
+    isOpen: m.isOpen === true,
+    openedFor: Array.isArray(m.openedFor) ? m.openedFor.filter((x): x is string => typeof x === 'string') : [],
+    at: num(m.at) ?? 0,
+  }
+}
+
+/** Remembers the pane's state for this session; losing it costs only a reopen. */
+async function rememberPane($: EngineInterface, isOpen: boolean): Promise<void> {
+  try {
+    const at = await $.clock.now()
+    const m: PaneMemory = { isOpen, openedFor: [...openedFor].slice(-100), at }
+    await $.store.set(`pane:${await $.session.id()}`, m)
+  } catch {}
+}
+
+async function prunePaneMemory($: EngineInterface): Promise<void> {
+  try {
+    const now = await $.clock.now()
+    for (const k of await $.store.keys()) {
+      if (!k.startsWith('pane:')) continue
+      const m = (await $.store.get(k)) as Partial<PaneMemory> | undefined
+      if (now - (num(m?.at) ?? 0) > PANE_KEEP_MS) await $.store.delete(k)
+    }
+  } catch {}
+}
+
+async function openPane($: EngineInterface): Promise<void> {
+  await $.ui.open({ id: PANE, title: 'Job status' })
+  await rememberPane($, true)
+}
+
+let timer: { cancel: () => void } | undefined
+let lastTick = 0
+
+/** Starts the poll timer, or replaces one that has stopped ticking. */
+async function ensureTimer($: EngineInterface): Promise<void> {
+  const now = await $.clock.now().catch(() => Date.now())
+  if (timer && now - lastTick < POLL_MS * 4) return
+  timer?.cancel()
+  lastTick = now
+  timer = $.clock.every(POLL_MS, () => {
+    void $.clock.now().then(t => { lastTick = t }, () => {})
+    void poll($)
+  })
+}
+
+/**
+ * Puts everything back after the session was away: the timer, a fresh poll,
+ * and the pane if it was open here and the engine no longer has it. Never throws.
+ */
+async function wake($: EngineInterface): Promise<void> {
+  try {
+    await ensureTimer($)
+    void poll($)
+    const m = await paneMemory($)
+    if (!m?.isOpen) return
+    const isUp = (await $.ui.panes()).some(p => p.id === PANE)
+    if (!isUp) await $.ui.open({ id: PANE, title: 'Job status' })
+  } catch {}
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -449,9 +523,30 @@ export const register: Register = on => {
       name: 'job-status',
       description: 'Show the live job-status pane (runs in ~/.claude/job-status); "clear" clears finished runs',
     })
-    void poll($)
-    $.clock.every(POLL_MS, () => poll($))
+    const m = await paneMemory($).catch(() => undefined)
+    for (const id of m?.openedFor ?? []) openedFor.add(id)
+    await wake($)
+    void prunePaneMemory($)
     return started
+  })
+
+  // A client joined (the app opened this session), or a turn began: the
+  // moments a session that was away is touched again.
+  on('session.attach', async ($, e, next) => {
+    const r = await next(e)
+    await wake($)
+    return r
+  })
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) void wake($)
+    return next(e)
+  })
+
+  // Closed by the person: stays closed until /job-status or a new run.
+  on('ui.close', async ($, e, next) => {
+    const r = await next(e)
+    if (e.id === PANE && e.origin.kind !== 'unload') await rememberPane($, false)
+    return r
   })
 
   on('command.run', { command: 'job-status' }, async ($, e) => {
@@ -461,7 +556,7 @@ export const register: Register = on => {
       return { text: n ? `Cleared ${n} finished run(s) into ~/.claude/job-status/.cleared.` : 'No finished runs to clear.' }
     }
     // Open first, so the pane shows up even while a poll is slow.
-    await $.ui.open({ id: PANE, title: 'Job status' })
+    await openPane($)
     const isFresh = await pollWithin($, COMMAND_WAIT_MS)
     const list = await read($, runs)
     const live = list.filter(r => r.state === 'running' && !r.isStale).length
