@@ -1,1 +1,1 @@
-{ "name": "job-status", "version": "0.3.1", "description": "Live pane for long-running job runs that write ~/.claude/job-status/<id>.json", "types": "./types/index.d.ts" }
+{ "name": "job-status", "version": "0.3.3", "description": "Live pane for long-running job runs that write ~/.claude/job-status/<id>.json", "types": "./types/index.d.ts" }
