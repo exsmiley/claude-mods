@@ -307,7 +307,6 @@ async function pollOnce($: EngineInterface, gen: number) {
     const active = list.filter(r => r.state === 'running')
     const table = active.length ? await procTable($) : undefined
     const memKb = active.length ? await machineMem($) : undefined
-    if (active.length) refreshDocker($, now)
     const vm = table ? dockerVmUsage(table) : undefined
     for (const r of active) {
       if (r.pid !== undefined && table && !table.procs.has(r.pid)) {
@@ -344,6 +343,8 @@ async function pollOnce($: EngineInterface, gen: number) {
         j.usage = usageOf(table, treeOf(table, [j.pid]))
       }
     }
+    // Only for a live run: a stale one has nothing to charge to Docker.
+    if (active.some(r => !r.isStale)) refreshDocker($, now, `${dir}/.docker`)
     let machine: Machine | null = null
     if (table && active.some(r => !r.isStale)) {
       machine = { cpu: table.cpuAll, cores: await cpuCores($), apps: topApps(table) }

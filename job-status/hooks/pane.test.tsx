@@ -379,6 +379,41 @@ test('a folder the pane cannot read is said, not shown as empty', async ($, on) 
   await ui.unmount()
 })
 
+/** the docker commands a poll ran, with the sample and lock the test gives it */
+async function dockerRuns($: never, on: never, files: Record<string, unknown>, isLockHeld: boolean) {
+  const ran: string[] = []
+  const world_ = world as (...a: unknown[]) => void
+  world_(on, files, PROCS, NOW, {
+    run: (argv: string[]) => {
+      if (argv[0] === 'docker' && argv[1] === 'stats') ran.push(argv[1])
+      if (argv[0] === 'mkdir' && argv[1] !== '-p') return { value: { exitCode: isLockHeld ? 1 : 0, stdout: '', stderr: '' } }
+      return undefined
+    },
+  })
+  const engine = $ as { session: { start: (e: unknown) => Promise<unknown> }; command: { run: (e: unknown) => Promise<unknown> } }
+  await engine.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await engine.command.run(RUN)
+  await engine.command.run(RUN)
+  return ran.length
+}
+
+test('docker is sampled when the lock is free and no sample is fresh', async ($, on) => {
+  expect(await dockerRuns($ as never, on as never, { 'live.json': live }, false)).toBe(1)
+})
+
+test('a fresh sample another session took is used as is', async ($, on) => {
+  const sample = { at: NOW - 5000, rows: [] }
+  expect(await dockerRuns($ as never, on as never, { 'live.json': live, 'sample.json': sample }, false)).toBe(0)
+})
+
+test('while another session holds the lock, docker is left alone', async ($, on) => {
+  expect(await dockerRuns($ as never, on as never, { 'live.json': live }, true)).toBe(0)
+})
+
+test('a stale run does not sample docker', async ($, on) => {
+  expect(await dockerRuns($ as never, on as never, { 'dead.json': dead }, false)).toBe(0)
+})
+
 const DONE = { 'old.json': { ...old, updatedAt: iso(60_000), endedAt: iso(60_000) } }
 const memory = (isOpen: boolean, openedFor: string[] = []) => ({ 'pane:sess-1': { isOpen, openedFor, at: NOW - 60_000 } })
 

@@ -159,10 +159,15 @@ export function topApps(t: ProcTable, n = 6): AppUsage[] {
 // ----------------------------------------------------------------- docker
 
 export type DockerRow = { name: string; cpu: number; rssKb: number; hostPorts: number[]; networks: string[] }
-const DOCKER_EVERY_MS = 10_000
+const DOCKER_EVERY_MS = 30_000
+// A sample older than this is another session's leftovers, not what is running.
+const DOCKER_OLD_MS = 120_000
+const DOCKER_LOCK_STALE_MS = 60_000
 const DOCKER_RETRY_MS = 60_000
+// How often a session looks at the shared sample.
+const DOCKER_CHECK_MS = 10_000
 let rows: DockerRow[] | undefined
-let rowsAt = 0
+let checkedAt = 0
 let isDown = false
 let dockerInFlight: Promise<void> | undefined
 
@@ -189,44 +194,87 @@ const jsonLines = (text: string): Record<string, string>[] =>
     }
   })
 
-// `docker stats` takes ~2 s, so it runs on its own cadence; polls read the
-// last sample.
-export function refreshDocker($: EngineInterface, now: number): void {
-  if (dockerInFlight || now - rowsAt < (isDown ? DOCKER_RETRY_MS : DOCKER_EVERY_MS)) return
+type Sample = { at: number; rows: DockerRow[] }
+
+async function readSample($: EngineInterface, file: string): Promise<Sample | undefined> {
+  try {
+    const s = JSON.parse(await $.fs.read(file)) as Sample
+    return Number.isFinite(s.at) && Array.isArray(s.rows) ? s : undefined
+  } catch {
+    return undefined // none yet, or caught half-written
+  }
+}
+
+async function sampleDocker($: EngineInterface): Promise<DockerRow[]> {
+  const [stats, ps] = await Promise.all([
+    $.process.run(['docker', 'stats', '--no-stream', '--format', '{{json .}}'], { timeoutMs: 15000 }),
+    $.process.run(['docker', 'ps', '--format', '{{json .}}'], { timeoutMs: 10000 }),
+  ])
+  if (stats.exitCode !== 0) throw new Error('docker stats failed')
+  const meta = new Map<string, { hostPorts: number[]; networks: string[] }>()
+  for (const o of jsonLines(ps.stdout)) {
+    meta.set(String(o.Names ?? ''), {
+      hostPorts: [...new Set([...String(o.Ports ?? '').matchAll(/:(\d+)->/g)].map(m => Number(m[1])))],
+      networks: String(o.Networks ?? '').split(',').map(n => n.trim()).filter(Boolean),
+    })
+  }
+  return jsonLines(stats.stdout).map(o => {
+    const name = String(o.Name ?? '')
+    return {
+      name,
+      cpu: Number(String(o.CPUPerc ?? '0').replace('%', '')) || 0,
+      rssKb: memToKb(String(o.MemUsage ?? '').split('/')[0] ?? ''),
+      hostPorts: meta.get(name)?.hostPorts ?? [],
+      networks: meta.get(name)?.networks ?? [],
+    }
+  })
+}
+
+// `docker stats` makes the Docker VM visit every container, and every open
+// session runs this mod. So the sessions share one sample, in `dir`: whoever
+// takes the lock (mkdir is atomic) when it is due samples, the rest read it.
+export function refreshDocker($: EngineInterface, now: number, dir: string): void {
+  if (dockerInFlight || now - checkedAt < (isDown ? DOCKER_RETRY_MS : DOCKER_CHECK_MS)) return
+  checkedAt = now
+  const file = `${dir}/sample.json`
+  const lock = `${dir}/lock`
+  const use = (s: Sample) => {
+    rows = s.rows
+    isDown = false
+  }
   dockerInFlight = (async () => {
+    const shared = await readSample($, file)
+    if (shared && now - shared.at < DOCKER_EVERY_MS) return use(shared)
+    await $.process.run(['mkdir', '-p', dir], { timeoutMs: 3000 })
+    const took = await $.process.run(['mkdir', lock], { timeoutMs: 3000 })
+    if (took.exitCode !== 0) {
+      // Someone else is sampling: show the last sample meanwhile. A lock left by
+      // a session that died goes, for the next check to take.
+      const made = await $.fs.stat(lock).then(s => s.mtimeMs, () => now)
+      if (now - made > DOCKER_LOCK_STALE_MS) await $.process.run(['rmdir', lock], { timeoutMs: 3000 })
+      if (shared && now - shared.at < DOCKER_OLD_MS) use(shared)
+      else rows = undefined
+      return
+    }
     try {
-      const [stats, ps] = await Promise.all([
-        $.process.run(['docker', 'stats', '--no-stream', '--format', '{{json .}}'], { timeoutMs: 15000 }),
-        $.process.run(['docker', 'ps', '--format', '{{json .}}'], { timeoutMs: 10000 }),
-      ])
-      if (stats.exitCode !== 0) throw new Error('docker stats failed')
-      const meta = new Map<string, { hostPorts: number[]; networks: string[] }>()
-      for (const o of jsonLines(ps.stdout)) {
-        meta.set(String(o.Names ?? ''), {
-          hostPorts: [...new Set([...String(o.Ports ?? '').matchAll(/:(\d+)->/g)].map(m => Number(m[1])))],
-          networks: String(o.Networks ?? '').split(',').map(n => n.trim()).filter(Boolean),
-        })
-      }
-      rows = jsonLines(stats.stdout).map(o => {
-        const name = String(o.Name ?? '')
-        return {
-          name,
-          cpu: Number(String(o.CPUPerc ?? '0').replace('%', '')) || 0,
-          rssKb: memToKb(String(o.MemUsage ?? '').split('/')[0] ?? ''),
-          hostPorts: meta.get(name)?.hostPorts ?? [],
-          networks: meta.get(name)?.networks ?? [],
-        }
-      })
-      isDown = false
+      // It may have been sampled between the read above and the lock.
+      const again = await readSample($, file)
+      if (again && now - again.at < DOCKER_EVERY_MS) return use(again)
+      const fresh = await sampleDocker($)
+      const at = await $.clock.now().catch(() => now)
+      use({ at, rows: fresh })
+      await $.fs.write(file, JSON.stringify({ at, rows: fresh })).catch(() => {})
     } catch {
       rows = undefined
       isDown = true
     } finally {
-      // the clock can be gone by now (the mod reloaded mid-sample)
-      rowsAt = await $.clock.now().catch(() => Date.now())
-      dockerInFlight = undefined
+      await $.process.run(['rmdir', lock], { timeoutMs: 3000 }).catch(() => {})
     }
-  })().catch(() => {})
+  })()
+    .catch(() => {})
+    .finally(() => {
+      dockerInFlight = undefined
+    })
 }
 
 /** Containers' usage at host cost: their share of the Docker VM, when it is seen. */
